@@ -1,0 +1,596 @@
+```yaml
+name: RDP + Tailscale + CentOS 9
+
+on:
+  workflow_dispatch:
+
+jobs:
+
+  secure-rdp:
+
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+
+      # ============================================================
+      # 1. Configure RDP
+      # ============================================================
+
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" `
+            -Value 0 `
+            -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389
+
+          Restart-Service -Name TermService -Force
+
+
+      # ============================================================
+      # 2. Create RDP User
+      # ============================================================
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = (
+                  [char[]](33..47) +
+                  [char[]](58..64) +
+                  [char[]](91..96) +
+                  [char[]](123..126)
+              )
+          }
+
+          $rawPassword = @()
+
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+
+          $password = -join (
+              $rawPassword | Sort-Object { Get-Random }
+          )
+
+          $securePass = ConvertTo-SecureString `
+              $password `
+              -AsPlainText `
+              -Force
+
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP"
+          }
+
+          New-LocalUser `
+              -Name "RDP" `
+              -Password $securePass `
+              -AccountNeverExpires
+
+          Add-LocalGroupMember `
+              -Group "Administrators" `
+              -Member "RDP"
+
+          Add-LocalGroupMember `
+              -Group "Remote Desktop Users" `
+              -Member "RDP"
+
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "RDP user creation failed"
+              exit 1
+          }
+
+          Write-Host "RDP user created successfully."
+
+
+      # ============================================================
+      # 3. Install Tailscale
+      # ============================================================
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Write-Host "Downloading Tailscale..."
+
+          Invoke-WebRequest `
+              -Uri $tsUrl `
+              -OutFile $installerPath
+
+          Write-Host "Installing Tailscale..."
+
+          Start-Process `
+              msiexec.exe `
+              -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+              -Wait
+
+          Remove-Item `
+              $installerPath `
+              -Force
+
+
+      # ============================================================
+      # 4. Connect Windows Runner to Tailscale
+      # ============================================================
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $Tailscale)) {
+              Write-Error "Tailscale executable not found."
+              exit 1
+          }
+
+          & $Tailscale up `
+              --authkey="$env:TAILSCALE_AUTH_KEY" `
+              --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          Start-Sleep -Seconds 5
+
+          $tsIP = $null
+
+          for ($i = 1; $i -le 20; $i++) {
+
+              $tsIP = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
+
+              if ($tsIP) {
+                  break
+              }
+
+              Write-Host "Waiting for Tailscale IP..."
+
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP was not assigned."
+              exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale IP: $tsIP"
+
+
+      # ============================================================
+      # 5. Verify Tailscale
+      # ============================================================
+
+      - name: Verify Tailscale
+        shell: powershell
+        run: |
+
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          Write-Host ""
+          Write-Host "========== TAILSCALE STATUS =========="
+
+          & $Tailscale status
+
+          Write-Host ""
+          Write-Host "Tailscale IPv4:"
+          & $Tailscale ip -4
+
+          Write-Host "======================================"
+          Write-Host ""
+
+
+      # ============================================================
+      # 6. Verify RDP
+      # ============================================================
+
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection `
+              -ComputerName $env:TAILSCALE_IP `
+              -Port 3389 `
+              -WarningAction SilentlyContinue
+
+          if (-not $testResult.TcpTestSucceeded) {
+
+              Write-Error "TCP connection to RDP port 3389 failed."
+
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "RDP TCP connectivity successful!" `
+              -ForegroundColor Green
+
+
+      # ============================================================
+      # 7. Download VirtualBox
+      # ============================================================
+
+      - name: Download VirtualBox
+        shell: powershell
+        run: |
+
+          $WorkDir = "$env:USERPROFILE\Downloads\CentOS9-VM"
+
+          New-Item `
+              -ItemType Directory `
+              -Force `
+              -Path $WorkDir | Out-Null
+
+          $VBoxVersion = "7.2.20"
+          $VBoxBuild   = "175154"
+
+          $VBoxInstaller = `
+              "$WorkDir\VirtualBox-$VBoxVersion-Win.exe"
+
+          $VBoxURL = `
+              "https://download.virtualbox.org/virtualbox/$VBoxVersion/VirtualBox-$VBoxVersion-$VBoxBuild-Win.exe"
+
+          Write-Host "Downloading VirtualBox..."
+
+          Invoke-WebRequest `
+              -Uri $VBoxURL `
+              -OutFile $VBoxInstaller
+
+          Write-Host "VirtualBox downloaded."
+
+
+      # ============================================================
+      # 8. Install VirtualBox
+      # ============================================================
+
+      - name: Install VirtualBox
+        shell: powershell
+        run: |
+
+          $VBoxManage = `
+              "${env:ProgramFiles}\Oracle\VirtualBox\VBoxManage.exe"
+
+          if (-not (Test-Path $VBoxManage)) {
+
+              $WorkDir = `
+                  "$env:USERPROFILE\Downloads\CentOS9-VM"
+
+              $VBoxInstaller = `
+                  "$WorkDir\VirtualBox-7.2.20-Win.exe"
+
+              Write-Host "Installing VirtualBox..."
+
+              Start-Process `
+                  -FilePath $VBoxInstaller `
+                  -ArgumentList "--silent" `
+                  -Wait `
+                  -NoNewWindow
+          }
+
+          if (-not (Test-Path $VBoxManage)) {
+
+              Write-Error "VirtualBox installation failed."
+
+              exit 1
+          }
+
+          Write-Host "VirtualBox installed successfully."
+
+
+      # ============================================================
+      # 9. Download CentOS Stream 9
+      # ============================================================
+
+      - name: Download CentOS Stream 9
+        shell: powershell
+        run: |
+
+          $WorkDir = `
+              "$env:USERPROFILE\Downloads\CentOS9-VM"
+
+          $ISOPath = `
+              "$WorkDir\CentOS-Stream-9-latest-x86_64-boot.iso"
+
+          $CentOSURL = `
+              "https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/iso/CentOS-Stream-9-latest-x86_64-boot.iso"
+
+          if (-not (Test-Path $ISOPath)) {
+
+              Write-Host "Downloading CentOS Stream 9..."
+
+              Invoke-WebRequest `
+                  -Uri $CentOSURL `
+                  -OutFile $ISOPath `
+                  -UseBasicParsing
+          }
+
+          Write-Host "CentOS ISO ready."
+
+          "CENTOS_ISO=$ISOPath" >> $env:GITHUB_ENV
+
+
+      # ============================================================
+      # 10. Create CentOS VM
+      # ============================================================
+
+      - name: Create CentOS 9 VM
+        shell: powershell
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          $VBoxManage = `
+              "${env:ProgramFiles}\Oracle\VirtualBox\VBoxManage.exe"
+
+          $VMName = "CentOS9-DevOps"
+
+          $RAM_MB = 4096
+          $CPU = 2
+          $DiskSize_MB = 40960
+
+          $ISOPath = $env:CENTOS_ISO
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host " Creating CentOS Stream 9 VM"
+          Write-Host "=========================================="
+
+          # ----------------------------------------
+          # Remove old VM
+          # ----------------------------------------
+
+          $ExistingVM = & $VBoxManage list vms |
+              Select-String "`"$VMName`""
+
+          if ($ExistingVM) {
+
+              Write-Host "Removing existing VM..."
+
+              & $VBoxManage controlvm `
+                  $VMName `
+                  poweroff 2>$null
+
+              Start-Sleep -Seconds 2
+
+              & $VBoxManage unregistervm `
+                  $VMName `
+                  --delete
+          }
+
+
+          # ----------------------------------------
+          # Create VM
+          # ----------------------------------------
+
+          & $VBoxManage createvm `
+              --name $VMName `
+              --ostype "RedHat_64" `
+              --register
+
+
+          # ----------------------------------------
+          # VM Hardware
+          # ----------------------------------------
+
+          & $VBoxManage modifyvm $VMName `
+              --memory $RAM_MB `
+              --cpus $CPU `
+              --vram 128 `
+              --ioapic on `
+              --boot1 dvd `
+              --boot2 disk `
+              --boot3 none `
+              --boot4 none `
+              --nic1 nat
+
+
+          # ----------------------------------------
+          # Create Disk
+          # ----------------------------------------
+
+          $VMFolder = `
+              "$env:USERPROFILE\VirtualBox VMs\$VMName"
+
+          $DiskPath = `
+              "$VMFolder\$VMName.vdi"
+
+          Write-Host "Creating 40 GB disk..."
+
+          & $VBoxManage createmedium disk `
+              --filename $DiskPath `
+              --size $DiskSize_MB `
+              --format VDI `
+              --variant Standard
+
+
+          # ----------------------------------------
+          # SATA Controller
+          # ----------------------------------------
+
+          & $VBoxManage storagectl $VMName `
+              --name "SATA Controller" `
+              --add sata `
+              --controller IntelAhci
+
+
+          # ----------------------------------------
+          # Attach HDD
+          # ----------------------------------------
+
+          & $VBoxManage storageattach $VMName `
+              --storagectl "SATA Controller" `
+              --port 0 `
+              --device 0 `
+              --type hdd `
+              --medium $DiskPath
+
+
+          # ----------------------------------------
+          # IDE Controller
+          # ----------------------------------------
+
+          & $VBoxManage storagectl $VMName `
+              --name "IDE Controller" `
+              --add ide
+
+
+          # ----------------------------------------
+          # Attach CentOS ISO
+          # ----------------------------------------
+
+          & $VBoxManage storageattach $VMName `
+              --storagectl "IDE Controller" `
+              --port 0 `
+              --device 0 `
+              --type dvddrive `
+              --medium $ISOPath
+
+
+          # ----------------------------------------
+          # Show VM configuration
+          # ----------------------------------------
+
+          Write-Host ""
+          Write-Host "VM Configuration:"
+          Write-Host "Name : $VMName"
+          Write-Host "CPU  : $CPU"
+          Write-Host "RAM  : 4096 MB"
+          Write-Host "Disk : 40 GB"
+
+          & $VBoxManage showvminfo $VMName --machinereadable
+
+
+      # ============================================================
+      # 11. Install CentOS
+      # ============================================================
+
+      - name: Start CentOS Installation
+        shell: powershell
+        run: |
+
+          $VBoxManage = `
+              "${env:ProgramFiles}\Oracle\VirtualBox\VBoxManage.exe"
+
+          $VMName = "CentOS9-DevOps"
+
+          Write-Host ""
+          Write-Host "Starting CentOS Stream 9 VM..."
+
+          & $VBoxManage startvm `
+              $VMName `
+              --type headless
+
+          if ($LASTEXITCODE -ne 0) {
+
+              Write-Error "Failed to start CentOS VM."
+
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "CentOS VM started."
+          Write-Host ""
+          Write-Host "NOTE:"
+          Write-Host "The CentOS boot ISO requires installation."
+          Write-Host "If unattended installation is required,"
+          Write-Host "we should use a CentOS Kickstart file."
+
+
+      # ============================================================
+      # 12. Display RDP Information
+      # ============================================================
+
+      - name: Display RDP Information
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "              RDP ACCESS"
+          Write-Host "=============================================="
+
+          Write-Host ""
+          Write-Host "Address:"
+          Write-Host "$env:TAILSCALE_IP"
+
+          Write-Host ""
+          Write-Host "Username:"
+          Write-Host "RDP"
+
+          Write-Host ""
+          Write-Host "Password:"
+          Write-Host "$env:RDP_PASSWORD"
+
+          Write-Host ""
+          Write-Host "=============================================="
+
+          Write-Host ""
+          Write-Host "CentOS VM:"
+          Write-Host "CentOS9-DevOps"
+
+          Write-Host ""
+          Write-Host "CPU: 2"
+          Write-Host "RAM: 4 GB"
+          Write-Host "Disk: 40 GB"
+
+          Write-Host ""
+          Write-Host "=============================================="
+
+
+      # ============================================================
+      # 13. Keep Runner Alive
+      # ============================================================
+
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "RDP session is active."
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host ""
+
+          while ($true) {
+
+              Write-Host `
+                  "[$(Get-Date)] RDP Active - Tailscale Active"
+
+              Start-Sleep -Seconds 300
+          }
+```
