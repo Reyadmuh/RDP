@@ -1,0 +1,910 @@
+name: CentOS 9 QEMU Lab
+
+on:
+  workflow_dispatch:
+
+jobs:
+  centos-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+
+      # =========================================================
+      # 1. Install QEMU and Required Tools
+      # =========================================================
+
+      - name: Install QEMU and Required Tools
+        shell: bash
+        run: |
+          set -e
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            cloud-image-utils \
+            openssh-client \
+            sshpass \
+            netcat-openbsd \
+            curl \
+            wget
+
+          echo "======================================"
+          echo "QEMU VERSION"
+          echo "======================================"
+
+          qemu-system-x86_64 --version
+          qemu-img --version
+
+
+      # =========================================================
+      # 2. Check KVM
+      # =========================================================
+
+      - name: Check KVM
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "CHECKING KVM"
+          echo "======================================"
+
+          if [ -e /dev/kvm ]; then
+            echo "KVM is available."
+            ls -l /dev/kvm
+          else
+            echo "WARNING: /dev/kvm is NOT available."
+            echo "QEMU will use software emulation."
+          fi
+
+
+      # =========================================================
+      # 3. Prepare CentOS Directory
+      # =========================================================
+
+      - name: Prepare CentOS Directory
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p "$HOME/centos"
+
+          echo "======================================"
+          echo "CENTOS DIRECTORY"
+          echo "======================================"
+
+          ls -la "$HOME/centos"
+
+
+      # =========================================================
+      # 4. Download CentOS Stream 9
+      # =========================================================
+
+      - name: Download CentOS Stream 9
+        shell: bash
+        run: |
+          set -e
+
+          cd "$HOME/centos"
+
+          echo "======================================"
+          echo "DOWNLOADING CENTOS STREAM 9"
+          echo "======================================"
+
+          URL="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20260922.0.x86_64.qcow2"
+
+          echo "CentOS URL:"
+          echo "$URL"
+
+          rm -f centos.qcow2
+
+          curl -4 \
+            -fL \
+            --retry 15 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 1800 \
+            -o centos.qcow2 \
+            "$URL"
+
+          echo "======================================"
+          echo "DOWNLOAD COMPLETED"
+          echo "======================================"
+
+          ls -lh centos.qcow2
+
+          echo "======================================"
+          echo "IMAGE INFORMATION"
+          echo "======================================"
+
+          qemu-img info centos.qcow2
+
+
+      # =========================================================
+      # 5. Validate CentOS Image
+      # =========================================================
+
+      - name: Validate CentOS Image
+        shell: bash
+        run: |
+          set -e
+
+          cd "$HOME/centos"
+
+          echo "======================================"
+          echo "VALIDATING CENTOS IMAGE"
+          echo "======================================"
+
+          if [ ! -f centos.qcow2 ]; then
+            echo "ERROR: centos.qcow2 does not exist."
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s centos.qcow2)
+
+          echo "Image size:"
+          echo "$FILE_SIZE bytes"
+
+          if [ "$FILE_SIZE" -lt 500000000 ]; then
+            echo "ERROR: CentOS image is too small."
+            file centos.qcow2
+            exit 1
+          fi
+
+          qemu-img check centos.qcow2
+
+          echo "CentOS image validation successful."
+
+
+      # =========================================================
+      # 6. Resize Disk to 40 GB
+      # =========================================================
+
+      - name: Create 40 GB Disk
+        shell: bash
+        run: |
+          set -e
+
+          cd "$HOME/centos"
+
+          echo "======================================"
+          echo "RESIZING DISK TO 40 GB"
+          echo "======================================"
+
+          qemu-img resize centos.qcow2 40G
+
+          echo "======================================"
+          echo "DISK INFORMATION"
+          echo "======================================"
+
+          qemu-img info centos.qcow2
+
+
+      # =========================================================
+      # 7. Create Cloud-Init
+      # =========================================================
+
+      - name: Create Cloud Init
+        shell: bash
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -e
+
+          SEED_DIR="$HOME/centos/seed"
+
+          mkdir -p "$SEED_DIR"
+
+          echo "======================================"
+          echo "CREATING CLOUD-INIT"
+          echo "======================================"
+
+          if [ -z "$TS_AUTH_KEY" ]; then
+            echo "ERROR: TAILSCALE_AUTH_KEY secret is empty."
+            echo
+            echo "Create GitHub Secret:"
+            echo "TAILSCALE_AUTH_KEY"
+            exit 1
+          fi
+
+          TS_AUTH_KEY_B64=$(printf '%s' "$TS_AUTH_KEY" | base64 -w 0)
+
+          cat > "$SEED_DIR/user-data" <<'CLOUDINIT'
+          #cloud-config
+
+          hostname: centos9-lab
+
+          manage_etc_hosts: true
+
+          users:
+            - default
+
+            - name: devops
+              gecos: DevOps User
+              groups:
+                - wheel
+              sudo:
+                - ALL=(ALL) NOPASSWD:ALL
+              shell: /bin/bash
+
+          ssh_pwauth: true
+
+          disable_root: false
+
+          chpasswd:
+            list: |
+              root:123456
+              devops:123456
+            expire: false
+
+          package_update: true
+
+          packages:
+            - openssh-server
+            - curl
+            - wget
+            - vim
+            - git
+            - tar
+            - gzip
+            - unzip
+            - net-tools
+            - bind-utils
+            - iproute
+            - procps-ng
+
+          write_files:
+
+            - path: /root/setup-tailscale.sh
+              permissions: '0700'
+              owner: root:root
+
+              content: |
+                #!/bin/bash
+
+                set -e
+
+                echo "======================================"
+                echo "INSTALLING TAILSCALE"
+                echo "======================================"
+
+                curl -4 -fsSL https://tailscale.com/install.sh | sh
+
+                systemctl enable --now tailscaled
+
+                sleep 5
+
+                TS_AUTH_KEY=$(printf '%s' '__TS_AUTH_KEY_B64__' | base64 -d)
+
+                if [ -z "$TS_AUTH_KEY" ]; then
+                  echo "ERROR: Tailscale authentication key is empty."
+                  exit 1
+                fi
+
+                echo "Connecting to Tailscale..."
+
+                tailscale up \
+                  --auth-key="$TS_AUTH_KEY" \
+                  --hostname="centos9-gh-__RUN_ID__" \
+                  --ssh=false
+
+                echo "Tailscale connected."
+
+                tailscale status > /root/tailscale-status.txt || true
+
+                tailscale ip -4 > /root/tailscale-ip.txt || true
+
+                chmod 600 /root/tailscale-status.txt
+                chmod 600 /root/tailscale-ip.txt
+
+                unset TS_AUTH_KEY
+
+          runcmd:
+
+            - systemctl enable sshd
+
+            - systemctl start sshd
+
+            - echo 'root:123456' | chpasswd
+
+            - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+            - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+
+            - systemctl restart sshd
+
+            - /root/setup-tailscale.sh
+
+            - echo "CentOS Stream 9 QEMU Lab" > /root/vm-info.txt
+            - echo "Hostname: centos9-lab" >> /root/vm-info.txt
+            - echo "CPU: 2" >> /root/vm-info.txt
+            - echo "RAM: 4 GB" >> /root/vm-info.txt
+            - echo "Disk: 40 GB" >> /root/vm-info.txt
+            - echo "SSH: Enabled" >> /root/vm-info.txt
+            - echo "Tailscale: Enabled" >> /root/vm-info.txt
+
+          final_message: "CentOS Stream 9 is ready."
+          CLOUDINIT
+
+          sed -i "s|__TS_AUTH_KEY_B64__|$TS_AUTH_KEY_B64|g" \
+            "$SEED_DIR/user-data"
+
+          sed -i "s|__RUN_ID__|$RUN_ID|g" \
+            "$SEED_DIR/user-data"
+
+          cat > "$SEED_DIR/meta-data" <<EOF
+          instance-id: centos9-gh-${RUN_ID}
+          local-hostname: centos9-lab
+          EOF
+
+          echo "======================================"
+          echo "CLOUD-INIT CREATED"
+          echo "======================================"
+
+          ls -lh "$SEED_DIR"
+
+
+      # =========================================================
+      # 8. Validate Cloud-Init
+      # =========================================================
+
+      - name: Validate Cloud Init
+        shell: bash
+        run: |
+          set -e
+
+          SEED_DIR="$HOME/centos/seed"
+
+          echo "======================================"
+          echo "VALIDATING CLOUD-INIT"
+          echo "======================================"
+
+          if [ ! -f "$SEED_DIR/user-data" ]; then
+            echo "ERROR: user-data was not created."
+            exit 1
+          fi
+
+          if [ ! -f "$SEED_DIR/meta-data" ]; then
+            echo "ERROR: meta-data was not created."
+            exit 1
+          fi
+
+          if grep -q '__TS_AUTH_KEY_B64__' "$SEED_DIR/user-data"; then
+            echo "ERROR: Tailscale placeholder was not replaced."
+            exit 1
+          fi
+
+          if grep -q '__RUN_ID__' "$SEED_DIR/user-data"; then
+            echo "ERROR: RUN_ID placeholder was not replaced."
+            exit 1
+          fi
+
+          echo "Cloud-init validation successful."
+
+
+      # =========================================================
+      # 9. Create Cloud-Init ISO
+      # =========================================================
+
+      - name: Create Cloud Init ISO
+        shell: bash
+        run: |
+          set -e
+
+          cd "$HOME/centos"
+
+          echo "======================================"
+          echo "CREATING CLOUD-INIT ISO"
+          echo "======================================"
+
+          rm -f seed.iso
+
+          cloud-localds \
+            seed.iso \
+            seed/user-data \
+            seed/meta-data
+
+          echo "======================================"
+          echo "SEED ISO CREATED"
+          echo "======================================"
+
+          ls -lh seed.iso
+
+
+      # =========================================================
+      # 10. Start CentOS VM
+      # =========================================================
+
+      - name: Start CentOS VM
+        shell: bash
+        run: |
+          set -e
+
+          cd "$HOME/centos"
+
+          echo "======================================"
+          echo "STARTING CENTOS VM"
+          echo "======================================"
+
+          rm -f centos.pid
+
+          if [ -e /dev/kvm ]; then
+
+            echo "KVM detected."
+            echo "Starting QEMU with hardware acceleration."
+
+            sudo qemu-system-x86_64 \
+              -enable-kvm \
+              -machine q35 \
+              -cpu host \
+              -smp 2 \
+              -m 4096 \
+              -drive file=centos.qcow2,if=virtio,format=qcow2 \
+              -drive file=seed.iso,media=cdrom,readonly=on \
+              -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
+              -device virtio-net-pci,netdev=net0 \
+              -nographic \
+              -daemonize \
+              -pidfile "$HOME/centos/centos.pid"
+
+          else
+
+            echo "KVM not detected."
+            echo "Starting QEMU with software emulation."
+
+            qemu-system-x86_64 \
+              -machine q35 \
+              -cpu max \
+              -smp 2 \
+              -m 4096 \
+              -drive file=centos.qcow2,if=virtio,format=qcow2 \
+              -drive file=seed.iso,media=cdrom,readonly=on \
+              -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
+              -device virtio-net-pci,netdev=net0 \
+              -nographic \
+              -daemonize \
+              -pidfile "$HOME/centos/centos.pid"
+
+          fi
+
+          sleep 10
+
+          echo "======================================"
+          echo "QEMU PROCESS"
+          echo "======================================"
+
+          ps aux | grep '[q]emu-system-x86_64' || true
+
+          echo "======================================"
+          echo "QEMU PID"
+          echo "======================================"
+
+          if [ -f "$HOME/centos/centos.pid" ]; then
+            cat "$HOME/centos/centos.pid"
+          else
+            echo "ERROR: QEMU PID file was not created."
+            exit 1
+          fi
+
+
+      # =========================================================
+      # 11. Wait for CentOS SSH
+      # =========================================================
+
+      - name: Wait for CentOS SSH
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "WAITING FOR CENTOS SSH"
+          echo "======================================"
+
+          SSH_READY=false
+
+          for i in {1..90}; do
+
+            if nc -z 127.0.0.1 2222 2>/dev/null; then
+
+              echo "SSH port is ready."
+
+              SSH_READY=true
+
+              break
+
+            fi
+
+            echo "Waiting for SSH... $i/90"
+
+            if [ -f "$HOME/centos/centos.pid" ]; then
+
+              PID=$(cat "$HOME/centos/centos.pid")
+
+              if ! kill -0 "$PID" 2>/dev/null; then
+
+                echo "ERROR: QEMU stopped unexpectedly."
+
+                exit 1
+
+              fi
+
+            fi
+
+            sleep 5
+
+          done
+
+          if [ "$SSH_READY" != "true" ]; then
+
+            echo "ERROR: SSH did not become available."
+
+            echo "======================================"
+            echo "QEMU PROCESS"
+            echo "======================================"
+
+            ps aux | grep '[q]emu-system-x86_64' || true
+
+            exit 1
+
+          fi
+
+
+      # =========================================================
+      # 12. Wait for Cloud-Init
+      # =========================================================
+
+      - name: Wait for Cloud Init
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "WAITING FOR CLOUD-INIT"
+          echo "======================================"
+
+          CLOUD_INIT_DONE=false
+
+          for i in {1..60}; do
+
+            RESULT=$(sshpass -p '123456' ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              -p 2222 \
+              root@127.0.0.1 \
+              "cloud-init status" 2>/dev/null || true)
+
+            echo "Cloud-init status: $RESULT"
+
+            if echo "$RESULT" | grep -q "status: done"; then
+
+              echo "Cloud-init completed."
+
+              CLOUD_INIT_DONE=true
+
+              break
+
+            fi
+
+            echo "Waiting for cloud-init... $i/60"
+
+            sleep 10
+
+          done
+
+          if [ "$CLOUD_INIT_DONE" != "true" ]; then
+
+            echo "WARNING: Cloud-init did not report done."
+
+            echo "Continuing with verification."
+
+          fi
+
+
+      # =========================================================
+      # 13. Verify CentOS
+      # =========================================================
+
+      - name: Verify CentOS
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "CENTOS SYSTEM INFORMATION"
+          echo "======================================"
+
+          echo "Operating System:"
+
+          sshpass -p '123456' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 \
+            -p 2222 \
+            root@127.0.0.1 \
+            "cat /etc/centos-release"
+
+          echo
+          echo "Kernel:"
+
+          sshpass -p '123456' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            root@127.0.0.1 \
+            "uname -a"
+
+          echo
+          echo "CPU:"
+
+          sshpass -p '123456' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            root@127.0.0.1 \
+            "nproc"
+
+          echo
+          echo "Memory:"
+
+          sshpass -p '123456' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            root@127.0.0.1 \
+            "free -h"
+
+          echo
+          echo "Disk:"
+
+          sshpass -p '123456' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            root@127.0.0.1 \
+            "df -h"
+
+          echo
+          echo "SSH service:"
+
+          sshpass -p '123456' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            root@127.0.0.1 \
+            "systemctl is-active sshd"
+
+
+      # =========================================================
+      # 14. Verify DevOps User
+      # =========================================================
+
+      - name: Verify DevOps User
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "VERIFYING DEVOPS USER"
+          echo "======================================"
+
+          sshpass -p '123456' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            root@127.0.0.1 \
+            "id devops"
+
+          echo
+
+          sshpass -p '123456' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            root@127.0.0.1 \
+            "groups devops"
+
+
+      # =========================================================
+      # 15. Get CentOS Tailscale IP
+      # =========================================================
+
+      - name: Get CentOS Tailscale IP
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "GETTING TAILSCALE IP"
+          echo "======================================"
+
+          TS_IP=""
+
+          for i in {1..60}; do
+
+            TS_IP=$(sshpass -p '123456' ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
+              -p 2222 \
+              root@127.0.0.1 \
+              "tailscale ip -4 2>/dev/null" || true)
+
+            TS_IP=$(echo "$TS_IP" | head -n 1 | tr -d '[:space:]')
+
+            if [ -n "$TS_IP" ]; then
+
+              echo "======================================"
+              echo "TAILSCALE IP FOUND"
+              echo "======================================"
+
+              echo "$TS_IP"
+
+              printf 'CENTOS_TS_IP=%s\n' "$TS_IP" >> "$GITHUB_ENV"
+
+              break
+
+            fi
+
+            echo "Waiting for Tailscale... $i/60"
+
+            sleep 5
+
+          done
+
+          if [ -z "$TS_IP" ]; then
+
+            echo "ERROR: Tailscale IP was not found."
+
+            echo "======================================"
+            echo "TAILSCALE STATUS"
+            echo "======================================"
+
+            sshpass -p '123456' ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -p 2222 \
+              root@127.0.0.1 \
+              "tailscale status || true"
+
+            exit 1
+
+          fi
+
+
+      # =========================================================
+      # 16. Verify Tailscale
+      # =========================================================
+
+      - name: Verify Tailscale
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "TAILSCALE STATUS"
+          echo "======================================"
+
+          echo "Tailscale IP:"
+
+          sshpass -p '123456' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            root@127.0.0.1 \
+            "tailscale ip -4"
+
+          echo
+          echo "Tailscale status:"
+
+          sshpass -p '123456' ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            root@127.0.0.1 \
+            "tailscale status"
+
+
+      # =========================================================
+      # 17. Show Connection Information
+      # =========================================================
+
+      - name: Show CentOS Information
+        shell: bash
+        run: |
+          echo
+          echo "=================================================="
+          echo "       CENTOS STREAM 9 VM IS READY"
+          echo "=================================================="
+          echo
+
+          echo "Tailscale IP:"
+          echo "$CENTOS_TS_IP"
+
+          echo
+
+          echo "SSH as root:"
+          echo "ssh root@$CENTOS_TS_IP"
+
+          echo
+
+          echo "Root password:"
+          echo "123456"
+
+          echo
+
+          echo "SSH as devops:"
+          echo "ssh devops@$CENTOS_TS_IP"
+
+          echo
+
+          echo "DevOps password:"
+          echo "123456"
+
+          echo
+
+          echo "CPU:"
+          echo "2"
+
+          echo
+
+          echo "RAM:"
+          echo "4 GB"
+
+          echo
+
+          echo "Disk:"
+          echo "40 GB"
+
+          echo
+
+          echo "=================================================="
+
+
+      # =========================================================
+      # 18. Keep VM Alive
+      # =========================================================
+
+      - name: Keep CentOS Alive
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "KEEPING CENTOS VM ALIVE"
+          echo "======================================"
+
+          while true; do
+
+            if [ -f "$HOME/centos/centos.pid" ]; then
+
+              PID=$(cat "$HOME/centos/centos.pid")
+
+              if kill -0 "$PID" 2>/dev/null; then
+
+                echo "$(date) - QEMU: RUNNING - PID: $PID"
+
+              else
+
+                echo "$(date) - QEMU: STOPPED"
+
+                exit 1
+
+              fi
+
+            else
+
+              echo "QEMU PID file not found."
+
+              exit 1
+
+            fi
+
+            sleep 300
+
+          done
