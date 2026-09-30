@@ -742,3 +742,311 @@ jobs:
 
       - name: Verify DevOps User
         shell: bash
+        run: |
+          set -e
+
+          SSH_KEY="$HOME/centos/ssh/id_ed25519"
+
+          echo "======================================"
+          echo "VERIFYING DEVOPS USER"
+          echo "======================================"
+
+          ssh \
+            -i "$SSH_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            devops@127.0.0.1 \
+            id devops
+
+          echo
+
+          ssh \
+            -i "$SSH_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            devops@127.0.0.1 \
+            groups devops
+
+          echo
+
+          echo "Testing sudo:"
+
+          ssh \
+            -i "$SSH_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            devops@127.0.0.1 \
+            sudo whoami
+
+
+      # =========================================================
+      # 17. Install and Configure Tailscale
+      # =========================================================
+
+      - name: Install and Configure Tailscale
+        shell: bash
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -e
+
+          SSH_KEY="$HOME/centos/ssh/id_ed25519"
+
+          echo "======================================"
+          echo "INSTALLING TAILSCALE INSIDE CENTOS"
+          echo "======================================"
+
+          if [ -z "$TS_AUTH_KEY" ]; then
+            echo "ERROR: TAILSCALE_AUTH_KEY secret is empty."
+            exit 1
+          fi
+
+          echo "Installing Tailscale..."
+
+          ssh \
+            -i "$SSH_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            devops@127.0.0.1 \
+            "curl -4 -fsSL https://tailscale.com/install.sh | sudo sh"
+
+          echo "Starting tailscaled..."
+
+          ssh \
+            -i "$SSH_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            devops@127.0.0.1 \
+            sudo systemctl enable --now tailscaled
+
+          echo "Transferring auth key securely..."
+
+          printf '%s' "$TS_AUTH_KEY" | ssh \
+            -i "$SSH_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            devops@127.0.0.1 \
+            "sudo tee /root/.tailscale-auth-key >/dev/null && sudo chmod 600 /root/.tailscale-auth-key"
+
+          echo "Connecting CentOS to Tailscale..."
+
+          ssh \
+            -i "$SSH_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            devops@127.0.0.1 \
+            "sudo tailscale up --auth-key=file:/root/.tailscale-auth-key --hostname=centos9-gh-${RUN_ID} --ssh=false"
+
+          echo "Removing temporary auth key..."
+
+          ssh \
+            -i "$SSH_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            devops@127.0.0.1 \
+            sudo rm -f /root/.tailscale-auth-key
+
+          echo "Tailscale configured successfully."
+
+
+      # =========================================================
+      # 18. Get CentOS Tailscale IP
+      # =========================================================
+
+      - name: Get CentOS Tailscale IP
+        shell: bash
+        run: |
+          set -e
+
+          SSH_KEY="$HOME/centos/ssh/id_ed25519"
+
+          echo "======================================"
+          echo "GETTING TAILSCALE IP"
+          echo "======================================"
+
+          TS_IP=""
+
+          for i in $(seq 1 60); do
+
+            TS_IP=$(ssh \
+              -i "$SSH_KEY" \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -p 2222 \
+              devops@127.0.0.1 \
+              "sudo tailscale ip -4 2>/dev/null || true")
+
+            TS_IP=$(echo "$TS_IP" | head -n 1 | tr -d '[:space:]')
+
+            if [ -n "$TS_IP" ]; then
+
+              echo "======================================"
+              echo "TAILSCALE IP FOUND"
+              echo "======================================"
+
+              echo "$TS_IP"
+
+              echo "CENTOS_TS_IP=$TS_IP" >> "$GITHUB_ENV"
+
+              break
+
+            fi
+
+            echo "Waiting for Tailscale... $i/60"
+
+            sleep 5
+
+          done
+
+          if [ -z "$TS_IP" ]; then
+
+            echo "ERROR: Tailscale IP was not found."
+
+            echo
+            echo "Tailscale status:"
+
+            ssh \
+              -i "$SSH_KEY" \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -p 2222 \
+              devops@127.0.0.1 \
+              sudo tailscale status || true
+
+            exit 1
+
+          fi
+
+
+      # =========================================================
+      # 19. Verify Tailscale
+      # =========================================================
+
+      - name: Verify Tailscale
+        shell: bash
+        run: |
+          set -e
+
+          SSH_KEY="$HOME/centos/ssh/id_ed25519"
+
+          echo "======================================"
+          echo "TAILSCALE INFORMATION"
+          echo "======================================"
+
+          echo "Tailscale IP:"
+
+          ssh \
+            -i "$SSH_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            devops@127.0.0.1 \
+            sudo tailscale ip -4
+
+          echo
+          echo "Tailscale status:"
+
+          ssh \
+            -i "$SSH_KEY" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -p 2222 \
+            devops@127.0.0.1 \
+            sudo tailscale status
+
+
+      # =========================================================
+      # 20. Show Connection Information
+      # =========================================================
+
+      - name: Show CentOS Information
+        shell: bash
+        run: |
+          echo
+          echo "=================================================="
+          echo "       CENTOS STREAM 9 VM IS READY"
+          echo "=================================================="
+          echo
+
+          echo "Tailscale IP:"
+          echo "$CENTOS_TS_IP"
+
+          echo
+
+          echo "SSH as devops:"
+          echo "ssh devops@$CENTOS_TS_IP"
+
+          echo
+
+          echo "DevOps password:"
+          echo "123456"
+
+          echo
+
+          echo "Root password:"
+          echo "123456"
+
+          echo
+
+          echo "CPU: 2"
+          echo "RAM: 4 GB"
+          echo "Disk: 40 GB"
+          echo "SSH: Enabled"
+          echo "Tailscale: Enabled"
+
+          echo
+
+          echo "=================================================="
+
+
+      # =========================================================
+      # 21. Keep VM Alive
+      # =========================================================
+
+      - name: Keep CentOS Alive
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "KEEPING CENTOS VM ALIVE"
+          echo "======================================"
+
+          while true; do
+
+            if sudo kill -0 "$CENTOS_QEMU_PID" 2>/dev/null; then
+
+              echo "$(date) - QEMU RUNNING - PID $CENTOS_QEMU_PID"
+
+            else
+
+              echo "$(date) - QEMU STOPPED"
+
+              exit 1
+
+            fi
+
+            sleep 300
+
+          done
