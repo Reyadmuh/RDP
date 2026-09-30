@@ -88,22 +88,25 @@ jobs:
         run: |
           set -e
 
-          mkdir -p "$HOME/centos"
+          CENTOS_DIR="$HOME/centos"
 
-          cd "$HOME/centos"
+          mkdir -p "$CENTOS_DIR"
+
+          cd "$CENTOS_DIR"
 
           echo "======================================"
           echo "DOWNLOADING CENTOS STREAM 9"
           echo "======================================"
 
-          URL=https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20260922.0.x86_64.qcow2
+          URL='https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20260922.0.x86_64.qcow2'
 
           echo "CentOS URL:"
           echo "$URL"
 
           rm -f centos.qcow2
 
-          curl -4 -fL \
+          curl -4 \
+            -fL \
             --retry 15 \
             --retry-delay 5 \
             --retry-all-errors \
@@ -120,8 +123,4 @@ jobs:
 
           echo "======================================"
           echo "IMAGE INFORMATION"
-          echo "======================================"
-
-          qemu-img info centos.qcow2
-
-          echo "CENTOS_IMAGE=$HOME/centos/centos.qcow2" >> "$GITHUB
+          echo "
