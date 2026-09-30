@@ -11,9 +11,10 @@ jobs:
     steps:
 
       # =========================================================
-      # 1. Install required packages
+      # 1. Install QEMU and required tools
       # =========================================================
       - name: Install QEMU and Required Tools
+        shell: bash
         run: |
           set -e
 
@@ -36,11 +37,15 @@ jobs:
           qemu-system-x86_64 --version
           qemu-img --version
 
+
       # =========================================================
       # 2. Check KVM
       # =========================================================
       - name: Check KVM
+        shell: bash
         run: |
+          set -e
+
           echo "======================================"
           echo "CHECKING KVM"
           echo "======================================"
@@ -53,31 +58,144 @@ jobs:
             echo "QEMU will use software emulation."
           fi
 
+
       # =========================================================
-      # 3. Prepare directory
+      # 3. Prepare CentOS directory
       # =========================================================
       - name: Prepare CentOS Directory
+        shell: bash
         run: |
           set -e
 
           mkdir -p "$HOME/centos"
 
-          echo "CentOS directory:"
+          echo "======================================"
+          echo "CENTOS DIRECTORY"
+          echo "======================================"
+
           ls -la "$HOME/centos"
+
 
       # =========================================================
       # 4. Download CentOS Stream 9
       # =========================================================
       - name: Download CentOS Stream 9
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p "$HOME/centos"
+          cd "$HOME/centos"
+
+          echo "======================================"
+          echo "DOWNLOADING CENTOS STREAM 9"
+          echo "======================================"
+
+          URL=https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20260922.0.x86_64.qcow2
+
+          echo "CentOS URL:"
+          echo "$URL"
+
+          rm -f centos.qcow2
+
+          curl -4 -fL \
+            --retry 15 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 1800 \
+            -o centos.qcow2 \
+            "$URL"
+
+          echo "======================================"
+          echo "DOWNLOAD COMPLETED"
+          echo "======================================"
+
+          ls -lh centos.qcow2
+
+          echo "======================================"
+          echo "IMAGE INFORMATION"
+          echo "======================================"
+
+          qemu-img info centos.qcow2
+
+          echo "CENTOS_IMAGE=$HOME/centos/centos.qcow2" >> "$GITHUB_ENV"
+
+
+      # =========================================================
+      # 5. Validate image
+      # =========================================================
+      - name: Validate CentOS Image
+        shell: bash
         run: |
           set -e
 
           cd "$HOME/centos"
 
-          # Pinned official CentOS Stream 9 image.
-          # Using a fixed version avoids depending on "latest".
-          URL="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20260922.0.x86_64.qcow2"
+          echo "======================================"
+          echo "VALIDATING CENTOS IMAGE"
+          echo "======================================"
+
+          if [ ! -f centos.qcow2 ]; then
+            echo "ERROR: centos.qcow2 does not exist."
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s centos.qcow2)
+
+          echo "Image size:"
+          echo "$FILE_SIZE bytes"
+
+          if [ "$FILE_SIZE" -lt 500000000 ]; then
+            echo "ERROR: Downloaded image is too small."
+            file centos.qcow2
+            exit 1
+          fi
+
+          qemu-img check centos.qcow2
+
+          echo "CentOS image validation successful."
+
+
+      # =========================================================
+      # 6. Resize disk to 40 GB
+      # =========================================================
+      - name: Create 40 GB Disk
+        shell: bash
+        run: |
+          set -e
+
+          cd "$HOME/centos"
 
           echo "======================================"
-          echo "DOWNLOADING CENTOS STREAM 9"
-          echo "======================================
+          echo "RESIZING DISK TO 40 GB"
+          echo "======================================"
+
+          qemu-img resize centos.qcow2 40G
+
+          echo "======================================"
+          echo "DISK INFORMATION"
+          echo "======================================"
+
+          qemu-img info centos.qcow2
+
+
+      # =========================================================
+      # 7. Create Cloud-Init configuration
+      # =========================================================
+      - name: Create Cloud Init
+        shell: bash
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -e
+
+          mkdir -p "$HOME/centos/seed"
+
+          echo "======================================"
+          echo "CREATING CLOUD-INIT"
+          echo "======================================"
+
+          if [ -z "$TS_AUTH_KEY" ]; then
+            echo "ERROR: TAIL
