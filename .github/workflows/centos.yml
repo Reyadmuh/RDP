@@ -95,7 +95,6 @@ jobs:
           SSH_DIR="$HOME/centos/ssh"
 
           mkdir -p "$SSH_DIR"
-
           chmod 700 "$SSH_DIR"
 
           rm -f "$SSH_DIR/id_ed25519"
@@ -110,7 +109,8 @@ jobs:
           chmod 600 "$SSH_DIR/id_ed25519"
           chmod 644 "$SSH_DIR/id_ed25519.pub"
 
-          echo "SSH public key:"
+          echo "SSH public key generated."
+
           cat "$SSH_DIR/id_ed25519.pub"
 
           echo "======================================"
@@ -246,9 +246,6 @@ jobs:
 
           if [ -z "$TS_AUTH_KEY" ]; then
             echo "ERROR: TAILSCALE_AUTH_KEY secret is empty."
-            echo
-            echo "Create GitHub Secret:"
-            echo "TAILSCALE_AUTH_KEY"
             exit 1
           fi
 
@@ -261,8 +258,6 @@ jobs:
 
           TS_AUTH_KEY_B64=$(printf '%s' "$TS_AUTH_KEY" | base64 -w 0)
 
-          SSH_PUBLIC_KEY_B64=$(printf '%s' "$SSH_PUBLIC_KEY" | base64 -w 0)
-
           cat > "$SEED_DIR/user-data" <<'CLOUDINIT'
           #cloud-config
 
@@ -274,10 +269,7 @@ jobs:
 
           disable_root: false
 
-          ssh_deletekeys: false
-
           users:
-
             - default
 
             - name: devops
@@ -318,221 +310,10 @@ jobs:
             - path: /root/setup-tailscale.sh
               permissions: '0700'
               owner: root:root
-
               content: |
                 #!/bin/bash
 
                 set -e
 
                 echo "======================================"
-                echo "INSTALLING TAILSCALE"
-                echo "======================================"
-
-                curl -4 -fsSL https://tailscale.com/install.sh | sh
-
-                systemctl enable --now tailscaled
-
-                sleep 5
-
-                TS_AUTH_KEY=$(printf '%s' '__TS_AUTH_KEY_B64__' | base64 -d)
-
-                if [ -z "$TS_AUTH_KEY" ]; then
-                  echo "ERROR: Tailscale authentication key is empty."
-                  exit 1
-                fi
-
-                echo "Connecting to Tailscale..."
-
-                tailscale up \
-                  --auth-key="$TS_AUTH_KEY" \
-                  --hostname="centos9-gh-__RUN_ID__" \
-                  --ssh=false
-
-                echo "Tailscale connected."
-
-                tailscale status > /root/tailscale-status.txt || true
-
-                tailscale ip -4 > /root/tailscale-ip.txt || true
-
-                chmod 600 /root/tailscale-status.txt
-                chmod 600 /root/tailscale-ip.txt
-
-                unset TS_AUTH_KEY
-
-          runcmd:
-
-            - systemctl enable sshd
-
-            - systemctl start sshd
-
-            - echo 'root:123456' | chpasswd
-
-            - echo 'devops:123456' | chpasswd
-
-            - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-
-            - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-
-            - systemctl restart sshd
-
-            - /root/setup-tailscale.sh
-
-            - echo "CentOS Stream 9 QEMU Lab" > /root/vm-info.txt
-            - echo "Hostname: centos9-lab" >> /root/vm-info.txt
-            - echo "CPU: 2" >> /root/vm-info.txt
-            - echo "RAM: 4 GB" >> /root/vm-info.txt
-            - echo "Disk: 40 GB" >> /root/vm-info.txt
-            - echo "SSH: Enabled" >> /root/vm-info.txt
-            - echo "Tailscale: Enabled" >> /root/vm-info.txt
-
-          final_message: "CentOS Stream 9 is ready."
-          CLOUDINIT
-
-          sed -i "s|__SSH_PUBLIC_KEY__|$SSH_PUBLIC_KEY|g" \
-            "$SEED_DIR/user-data"
-
-          sed -i "s|__TS_AUTH_KEY_B64__|$TS_AUTH_KEY_B64|g" \
-            "$SEED_DIR/user-data"
-
-          sed -i "s|__RUN_ID__|$RUN_ID|g" \
-            "$SEED_DIR/user-data"
-
-          cat > "$SEED_DIR/meta-data" <<EOF
-          instance-id: centos9-gh-${RUN_ID}
-          local-hostname: centos9-lab
-          EOF
-
-          echo "======================================"
-          echo "CLOUD-INIT CREATED"
-          echo "======================================"
-
-          ls -lh "$SEED_DIR"
-
-
-      # =========================================================
-      # 9. Validate Cloud-Init
-      # =========================================================
-
-      - name: Validate Cloud Init
-        shell: bash
-        run: |
-          set -e
-
-          SEED_DIR="$HOME/centos/seed"
-
-          echo "======================================"
-          echo "VALIDATING CLOUD-INIT"
-          echo "======================================"
-
-          test -f "$SEED_DIR/user-data"
-          test -f "$SEED_DIR/meta-data"
-
-          if grep -q '__SSH_PUBLIC_KEY__' "$SEED_DIR/user-data"; then
-            echo "ERROR: SSH key placeholder was not replaced."
-            exit 1
-          fi
-
-          if grep -q '__TS_AUTH_KEY_B64__' "$SEED_DIR/user-data"; then
-            echo "ERROR: Tailscale placeholder was not replaced."
-            exit 1
-          fi
-
-          if grep -q '__RUN_ID__' "$SEED_DIR/user-data"; then
-            echo "ERROR: RUN_ID placeholder was not replaced."
-            exit 1
-          fi
-
-          echo "Cloud-init validation successful."
-
-
-      # =========================================================
-      # 10. Create Cloud-Init ISO
-      # =========================================================
-
-      - name: Create Cloud Init ISO
-        shell: bash
-        run: |
-          set -e
-
-          cd "$HOME/centos"
-
-          echo "======================================"
-          echo "CREATING CLOUD-INIT ISO"
-          echo "======================================"
-
-          rm -f seed.iso
-
-          cloud-localds \
-            seed.iso \
-            seed/user-data \
-            seed/meta-data
-
-          echo "======================================"
-          echo "SEED ISO CREATED"
-          echo "======================================"
-
-          ls -lh seed.iso
-
-
-      # =========================================================
-      # 11. Start CentOS VM
-      # =========================================================
-
-      - name: Start CentOS VM
-        shell: bash
-        run: |
-          set -e
-
-          cd "$HOME/centos"
-
-          echo "======================================"
-          echo "STARTING CENTOS VM"
-          echo "======================================"
-
-          PID_FILE="/tmp/centos-qemu-${GITHUB_RUN_ID}.pid"
-
-          rm -f "$PID_FILE"
-
-          if [ -e /dev/kvm ]; then
-
-            echo "KVM detected."
-            echo "Starting QEMU with hardware acceleration."
-
-            sudo qemu-system-x86_64 \
-              -enable-kvm \
-              -machine q35 \
-              -cpu host \
-              -smp 2 \
-              -m 4096 \
-              -drive file=centos.qcow2,if=virtio,format=qcow2 \
-              -drive file=seed.iso,media=cdrom,readonly=on \
-              -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
-              -device virtio-net-pci,netdev=net0 \
-              -display none \
-              -daemonize \
-              -pidfile "$PID_FILE"
-
-          else
-
-            echo "KVM not detected."
-            echo "Starting QEMU with software emulation."
-
-            qemu-system-x86_64 \
-              -machine q35 \
-              -cpu max \
-              -smp 2 \
-              -m 4096 \
-              -drive file=centos.qcow2,if=virtio,format=qcow2 \
-              -drive file=seed.iso,media=cdrom,readonly=on \
-              -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
-              -device virtio-net-pci,netdev=net0 \
-              -display none \
-              -daemonize \
-              -pidfile "$PID_FILE"
-
-          fi
-
-          sleep 10
-
-          echo "======================================"
-          echo "
+                echo "INSTALLING TAILSCALE
