@@ -53,12 +53,3 @@ jobs:
           echo "======================================"
 
           if [ -e /dev/kvm ]; then
-            echo "KVM is available."
-            ls -l /dev/kvm
-          else
-            echo "WARNING: /dev/kvm is NOT available."
-            echo "QEMU will use software emulation."
-          fi
-
-
-      # =================================================
