@@ -124,7 +124,8 @@ jobs:
 
           rm -f centos.qcow2
 
-          curl -4 -fL \
+          curl -4 \
+            -fL \
             --retry 15 \
             --retry-delay 5 \
             --retry-all-errors \
@@ -138,6 +139,10 @@ jobs:
           echo "======================================"
 
           ls -lh centos.qcow2
+
+          echo "======================================"
+          echo "IMAGE INFORMATION"
+          echo "======================================"
 
           qemu-img info centos.qcow2
 
@@ -208,7 +213,6 @@ jobs:
       - name: Create Cloud Init
         shell: bash
         env:
-          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -e
@@ -222,19 +226,12 @@ jobs:
           echo "CREATING CLOUD-INIT"
           echo "======================================"
 
-          if [ -z "$TS_AUTH_KEY" ]; then
-            echo "ERROR: TAILSCALE_AUTH_KEY secret is empty."
-            exit 1
-          fi
-
           if [ ! -f "$SSH_DIR/id_ed25519.pub" ]; then
             echo "ERROR: SSH public key does not exist."
             exit 1
           fi
 
           SSH_PUBLIC_KEY=$(cat "$SSH_DIR/id_ed25519.pub")
-
-          TS_AUTH_KEY_B64=$(printf '%s' "$TS_AUTH_KEY" | base64 -w 0)
 
           cat > "$SEED_DIR/user-data" <<'CLOUDINIT'
           #cloud-config
@@ -248,16 +245,16 @@ jobs:
           disable_root: false
 
           users:
-
             - default
 
             - name: devops
               gecos: DevOps User
               groups:
                 - wheel
-              sudo: ALL=(ALL) NOPASSWD:ALL
+              sudo: "ALL=(ALL) NOPASSWD:ALL"
               shell: /bin/bash
               lock_passwd: false
+
               ssh_authorized_keys:
                 - __SSH_PUBLIC_KEY__
 
@@ -284,83 +281,18 @@ jobs:
             - procps-ng
 
           write_files:
-
-            - path: /root/setup-tailscale.sh
-              permissions: '0700'
+            - path: /etc/ssh/sshd_config.d/99-centos-lab.conf
+              permissions: '0644'
               owner: root:root
-
               content: |
-                #!/bin/bash
-
-                set -e
-
-                echo "======================================"
-                echo "INSTALLING TAILSCALE"
-                echo "======================================"
-
-                curl -4 -fsSL https://tailscale.com/install.sh | sh
-
-                systemctl enable --now tailscaled
-
-                sleep 5
-
-                TS_AUTH_KEY=$(printf '%s' '__TS_AUTH_KEY_B64__' | base64 -d)
-
-                if [ -z "$TS_AUTH_KEY" ]; then
-                  echo "ERROR: Empty Tailscale auth key."
-                  exit 1
-                fi
-
-                echo "Connecting to Tailscale..."
-
-                tailscale up \
-                  --auth-key="$TS_AUTH_KEY" \
-                  --hostname="centos9-gh-__RUN_ID__" \
-                  --ssh=false
-
-                echo "Tailscale connected."
-
-                tailscale status > /root/tailscale-status.txt || true
-
-                tailscale ip -4 > /root/tailscale-ip.txt || true
-
-                chmod 600 /root/tailscale-status.txt
-
-                chmod 600 /root/tailscale-ip.txt
-
-                unset TS_AUTH_KEY
+                PasswordAuthentication yes
+                PermitRootLogin yes
 
           runcmd:
-
-            - systemctl enable sshd
-
-            - systemctl start sshd
-
-            - echo 'root:123456' | chpasswd
-
-            - echo 'devops:123456' | chpasswd
-
-            - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-
-            - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-
-            - systemctl restart sshd
-
-            - /root/setup-tailscale.sh
-
-            - echo 'CentOS Stream 9 QEMU Lab' > /root/vm-info.txt
-
-            - echo 'Hostname: centos9-lab' >> /root/vm-info.txt
-
-            - echo 'CPU: 2' >> /root/vm-info.txt
-
-            - echo 'RAM: 4 GB' >> /root/vm-info.txt
-
-            - echo 'Disk: 40 GB' >> /root/vm-info.txt
-
-            - echo 'SSH: Enabled' >> /root/vm-info.txt
-
-            - echo 'Tailscale: Enabled' >> /root/vm-info.txt
+            - [systemctl, enable, sshd]
+            - [systemctl, start, sshd]
+            - [sshd, -t]
+            - [systemctl, restart, sshd]
 
           final_message: "CentOS Stream 9 is ready."
           CLOUDINIT
@@ -368,18 +300,16 @@ jobs:
           sed -i "s|__SSH_PUBLIC_KEY__|$SSH_PUBLIC_KEY|g" \
             "$SEED_DIR/user-data"
 
-          sed -i "s|__TS_AUTH_KEY_B64__|$TS_AUTH_KEY_B64|g" \
-            "$SEED_DIR/user-data"
-
-          sed -i "s|__RUN_ID__|$RUN_ID|g" \
-            "$SEED_DIR/user-data"
-
           cat > "$SEED_DIR/meta-data" <<EOF
           instance-id: centos9-gh-${RUN_ID}
           local-hostname: centos9-lab
           EOF
 
-          echo "Cloud-init files created successfully."
+          echo "======================================"
+          echo "CLOUD-INIT CREATED"
+          echo "======================================"
+
+          ls -lh "$SEED_DIR"
 
 
       # =========================================================
@@ -403,16 +333,6 @@ jobs:
 
           if grep -q '__SSH_PUBLIC_KEY__' "$USER_DATA"; then
             echo "ERROR: SSH placeholder was not replaced."
-            exit 1
-          fi
-
-          if grep -q '__TS_AUTH_KEY_B64__' "$USER_DATA"; then
-            echo "ERROR: Tailscale placeholder was not replaced."
-            exit 1
-          fi
-
-          if grep -q '__RUN_ID__' "$USER_DATA"; then
-            echo "ERROR: RUN_ID placeholder was not replaced."
             exit 1
           fi
 
@@ -636,11 +556,11 @@ jobs:
           echo "WAITING FOR CLOUD-INIT"
           echo "======================================"
 
-          CLOUD_INIT_STATUS=""
+          CLOUD_INIT_DONE=0
 
           for i in $(seq 1 60); do
 
-            CLOUD_INIT_STATUS=$(ssh \
+            STATUS=$(ssh \
               -i "$SSH_KEY" \
               -o IdentitiesOnly=yes \
               -o StrictHostKeyChecking=no \
@@ -652,41 +572,28 @@ jobs:
 
             echo "--------------------------------------"
             echo "Cloud-init attempt: $i/60"
-            echo "$CLOUD_INIT_STATUS"
+            echo "$STATUS"
             echo "--------------------------------------"
 
-            if echo "$CLOUD_INIT_STATUS" | grep -q "status: done"; then
+            if echo "$STATUS" | grep -q "status: done"; then
 
               echo "======================================"
               echo "CLOUD-INIT COMPLETED"
               echo "======================================"
 
+              CLOUD_INIT_DONE=1
+
               break
 
             fi
 
-            if echo "$CLOUD_INIT_STATUS" | grep -q "status: error"; then
+            if echo "$STATUS" | grep -q "status: error"; then
 
               echo "======================================"
               echo "CLOUD-INIT REPORTED ERROR"
               echo "======================================"
 
-              echo "Cloud-init status:"
-              echo "$CLOUD_INIT_STATUS"
-
-              echo
-              echo "Cloud-init output log:"
-
-              ssh \
-                -i "$SSH_KEY" \
-                -o IdentitiesOnly=yes \
-                -o StrictHostKeyChecking=no \
-                -o UserKnownHostsFile=/dev/null \
-                -p 2222 \
-                devops@127.0.0.1 \
-                "sudo tail -150 /var/log/cloud-init-output.log || true"
-
-              exit 1
+              break
 
             fi
 
@@ -696,17 +603,25 @@ jobs:
 
           done
 
-          if ! echo "$CLOUD_INIT_STATUS" | grep -q "status: done"; then
+          if [ "$CLOUD_INIT_DONE" -ne 1 ]; then
 
             echo "======================================"
             echo "ERROR: CLOUD-INIT DID NOT COMPLETE"
             echo "======================================"
 
-            echo "Final status:"
-            echo "$CLOUD_INIT_STATUS"
+            echo "Final cloud-init status:"
+
+            ssh \
+              -i "$SSH_KEY" \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -p 2222 \
+              devops@127.0.0.1 \
+              "sudo cloud-init status --long || true"
 
             echo
-            echo "Cloud-init output log:"
+            echo "cloud-init-output.log:"
 
             ssh \
               -i "$SSH_KEY" \
@@ -716,6 +631,18 @@ jobs:
               -p 2222 \
               devops@127.0.0.1 \
               "sudo tail -200 /var/log/cloud-init-output.log || true"
+
+            echo
+            echo "cloud-init.log:"
+
+            ssh \
+              -i "$SSH_KEY" \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -p 2222 \
+              devops@127.0.0.1 \
+              "sudo tail -100 /var/log/cloud-init.log || true"
 
             exit 1
 
@@ -815,246 +742,3 @@ jobs:
 
       - name: Verify DevOps User
         shell: bash
-        run: |
-          set -e
-
-          SSH_KEY="$HOME/centos/ssh/id_ed25519"
-
-          echo "======================================"
-          echo "VERIFYING DEVOPS USER"
-          echo "======================================"
-
-          ssh \
-            -i "$SSH_KEY" \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -p 2222 \
-            devops@127.0.0.1 \
-            id devops
-
-          echo
-
-          ssh \
-            -i "$SSH_KEY" \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -p 2222 \
-            devops@127.0.0.1 \
-            groups devops
-
-          echo
-
-          echo "Testing sudo:"
-
-          ssh \
-            -i "$SSH_KEY" \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -p 2222 \
-            devops@127.0.0.1 \
-            sudo whoami
-
-
-      # =========================================================
-      # 17. Get CentOS Tailscale IP
-      # =========================================================
-
-      - name: Get CentOS Tailscale IP
-        shell: bash
-        run: |
-          set -e
-
-          SSH_KEY="$HOME/centos/ssh/id_ed25519"
-
-          TS_IP=""
-
-          echo "======================================"
-          echo "GETTING TAILSCALE IP"
-          echo "======================================"
-
-          for i in $(seq 1 60); do
-
-            TS_IP=$(ssh \
-              -i "$SSH_KEY" \
-              -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              -p 2222 \
-              devops@127.0.0.1 \
-              "sudo tailscale ip -4 2>/dev/null || true")
-
-            TS_IP=$(echo "$TS_IP" | head -n 1 | tr -d '[:space:]')
-
-            if [ -n "$TS_IP" ]; then
-
-              echo "======================================"
-              echo "TAILSCALE IP FOUND"
-              echo "======================================"
-
-              echo "$TS_IP"
-
-              echo "CENTOS_TS_IP=$TS_IP" >> "$GITHUB_ENV"
-
-              break
-
-            fi
-
-            echo "Waiting for Tailscale... $i/60"
-
-            sleep 5
-
-          done
-
-          if [ -z "$TS_IP" ]; then
-
-            echo "ERROR: Tailscale IP was not found."
-
-            echo "Tailscale status:"
-
-            ssh \
-              -i "$SSH_KEY" \
-              -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              -p 2222 \
-              devops@127.0.0.1 \
-              sudo tailscale status || true
-
-            exit 1
-
-          fi
-
-
-      # =========================================================
-      # 18. Verify Tailscale
-      # =========================================================
-
-      - name: Verify Tailscale
-        shell: bash
-        run: |
-          set -e
-
-          SSH_KEY="$HOME/centos/ssh/id_ed25519"
-
-          echo "======================================"
-          echo "TAILSCALE INFORMATION"
-          echo "======================================"
-
-          echo "Tailscale IP:"
-
-          ssh \
-            -i "$SSH_KEY" \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -p 2222 \
-            devops@127.0.0.1 \
-            sudo tailscale ip -4
-
-          echo
-          echo "Tailscale status:"
-
-          ssh \
-            -i "$SSH_KEY" \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -p 2222 \
-            devops@127.0.0.1 \
-            sudo tailscale status
-
-
-      # =========================================================
-      # 19. Show Connection Information
-      # =========================================================
-
-      - name: Show CentOS Information
-        shell: bash
-        run: |
-          echo
-          echo "=================================================="
-          echo "       CENTOS STREAM 9 VM IS READY"
-          echo "=================================================="
-          echo
-
-          echo "Tailscale IP:"
-          echo "$CENTOS_TS_IP"
-
-          echo
-
-          echo "SSH as devops:"
-          echo "ssh devops@$CENTOS_TS_IP"
-
-          echo
-
-          echo "DevOps password:"
-          echo "123456"
-
-          echo
-
-          echo "Root password:"
-          echo "123456"
-
-          echo
-
-          echo "CPU:"
-          echo "2"
-
-          echo
-
-          echo "RAM:"
-          echo "4 GB"
-
-          echo
-
-          echo "Disk:"
-          echo "40 GB"
-
-          echo
-
-          echo "SSH:"
-          echo "Enabled"
-
-          echo
-
-          echo "Tailscale:"
-          echo "Enabled"
-
-          echo
-
-          echo "=================================================="
-
-
-      # =========================================================
-      # 20. Keep VM Alive
-      # =========================================================
-
-      - name: Keep CentOS Alive
-        shell: bash
-        run: |
-          set -e
-
-          echo "======================================"
-          echo "KEEPING CENTOS VM ALIVE"
-          echo "======================================"
-
-          while true; do
-
-            if sudo kill -0 "$CENTOS_QEMU_PID" 2>/dev/null; then
-
-              echo "$(date) - QEMU RUNNING - PID $CENTOS_QEMU_PID"
-
-            else
-
-              echo "$(date) - QEMU STOPPED"
-
-              exit 1
-
-            fi
-
-            sleep 300
-
-          done
