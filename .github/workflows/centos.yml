@@ -431,7 +431,9 @@ jobs:
           echo "STARTING CENTOS VM"
           echo "======================================"
 
-          rm -f centos.pid
+          PID_FILE="/tmp/centos-qemu-${GITHUB_RUN_ID}.pid"
+
+          rm -f "$PID_FILE"
 
           if [ -e /dev/kvm ]; then
 
@@ -450,7 +452,7 @@ jobs:
               -device virtio-net-pci,netdev=net0 \
               -display none \
               -daemonize \
-              -pidfile "$HOME/centos/centos.pid"
+              -pidfile "$PID_FILE"
 
           else
 
@@ -468,7 +470,7 @@ jobs:
               -device virtio-net-pci,netdev=net0 \
               -display none \
               -daemonize \
-              -pidfile "$HOME/centos/centos.pid"
+              -pidfile "$PID_FILE"
 
           fi
 
@@ -484,11 +486,21 @@ jobs:
           echo "QEMU PID"
           echo "======================================"
 
-          if [ -f "$HOME/centos/centos.pid" ]; then
-            cat "$HOME/centos/centos.pid"
+          if [ -f "$PID_FILE" ]; then
+
+            QEMU_PID=$(sudo cat "$PID_FILE")
+
+            echo "QEMU PID: $QEMU_PID"
+
+            echo "CENTOS_QEMU_PID=$QEMU_PID" >> "$GITHUB_ENV"
+            echo "CENTOS_QEMU_PID_FILE=$PID_FILE" >> "$GITHUB_ENV"
+
           else
+
             echo "ERROR: QEMU PID file was not created."
+
             exit 1
+
           fi
 
 
@@ -521,13 +533,17 @@ jobs:
 
             echo "Waiting for SSH... $i/90"
 
-            if [ -f "$HOME/centos/centos.pid" ]; then
+            if [ -n "$CENTOS_QEMU_PID" ]; then
 
-              PID=$(cat "$HOME/centos/centos.pid")
-
-              if ! kill -0 "$PID" 2>/dev/null; then
+              if ! sudo kill -0 "$CENTOS_QEMU_PID" 2>/dev/null; then
 
                 echo "ERROR: QEMU stopped unexpectedly."
+
+                echo "======================================"
+                echo "QEMU PROCESS"
+                echo "======================================"
+
+                ps aux | grep '[q]emu-system-x86_64' || true
 
                 exit 1
 
@@ -881,13 +897,11 @@ jobs:
 
           while true; do
 
-            if [ -f "$HOME/centos/centos.pid" ]; then
+            if [ -n "$CENTOS_QEMU_PID" ]; then
 
-              PID=$(cat "$HOME/centos/centos.pid")
+              if sudo kill -0 "$CENTOS_QEMU_PID" 2>/dev/null; then
 
-              if kill -0 "$PID" 2>/dev/null; then
-
-                echo "$(date) - QEMU: RUNNING - PID: $PID"
+                echo "$(date) - QEMU: RUNNING - PID: $CENTOS_QEMU_PID"
 
               else
 
@@ -899,7 +913,7 @@ jobs:
 
             else
 
-              echo "QEMU PID file not found."
+              echo "QEMU PID is not available."
 
               exit 1
 
