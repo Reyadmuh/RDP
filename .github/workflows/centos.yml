@@ -113,7 +113,7 @@ jobs:
 
           cd "$HOME/centos"
 
-          URL="https://odcs.stream.centos.org/production/latest-CentOS-Stream/compose/BaseOS/x86_64/images/CentOS-Stream-GenericCloud-9-20261006.0.x86_64.qcow2"
+          URL="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20261006.0.x86_64.qcow2"
 
           echo "======================================"
           echo "DOWNLOADING CENTOS STREAM 9"
