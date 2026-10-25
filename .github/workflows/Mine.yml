@@ -51,12 +51,6 @@ jobs:
           echo "CHECKING KVM"
           echo "======================================"
 
-          echo "Runner resource availability:"
-          nproc
-          free -h
-          df -h "$HOME"
-          echo "Note: allocating 16 GB RAM and 8 vCPUs may exceed standard ubuntu-latest runner capacity."
-
           if [ -e /dev/kvm ]; then
             echo "KVM is available."
             ls -l /dev/kvm
@@ -119,7 +113,7 @@ jobs:
 
           cd "$HOME/centos"
 
-          URL="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20260922.0.x86_64.qcow2"
+          URL="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20261006.0.x86_64.qcow2"
 
           echo "======================================"
           echo "DOWNLOADING CENTOS STREAM 9"
