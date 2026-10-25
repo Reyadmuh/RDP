@@ -113,7 +113,7 @@ jobs:
 
           cd "$HOME/centos"
 
-          URL="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20260922.0.x86_64.qcow2"
+          URL="https://odcs.stream.centos.org/production/latest-CentOS-Stream/compose/BaseOS/x86_64/images/CentOS-Stream-GenericCloud-9-20261006.0.x86_64.qcow2"
 
           echo "======================================"
           echo "DOWNLOADING CENTOS STREAM 9"
@@ -183,10 +183,10 @@ jobs:
 
 
       # =========================================================
-      # 7. Resize Disk to 40 GB
+      # 7. Resize Disk to 200 GB
       # =========================================================
 
-      - name: Create 40 GB Disk
+      - name: Create 200 GB Disk
         shell: bash
         run: |
           set -e
@@ -194,10 +194,10 @@ jobs:
           cd "$HOME/centos"
 
           echo "======================================"
-          echo "RESIZING DISK TO 40 GB"
+          echo "RESIZING DISK TO 200 GB"
           echo "======================================"
 
-          qemu-img resize centos.qcow2 40G
+          qemu-img resize centos.qcow2 200G
 
           echo "======================================"
           echo "DISK INFORMATION"
@@ -396,8 +396,8 @@ jobs:
               -enable-kvm \
               -machine q35 \
               -cpu host \
-              -smp 2 \
-              -m 4096 \
+              -smp 4 \
+              -m 16384 \
               -drive file=centos.qcow2,if=virtio,format=qcow2 \
               -drive file=seed.iso,media=cdrom,readonly=on \
               -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
@@ -414,8 +414,8 @@ jobs:
             qemu-system-x86_64 \
               -machine q35 \
               -cpu max \
-              -smp 2 \
-              -m 4096 \
+              -smp 4 \
+              -m 16384 \
               -drive file=centos.qcow2,if=virtio,format=qcow2 \
               -drive file=seed.iso,media=cdrom,readonly=on \
               -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
@@ -1009,9 +1009,9 @@ jobs:
 
           echo
 
-          echo "CPU: 2"
-          echo "RAM: 4 GB"
-          echo "Disk: 40 GB"
+          echo "CPU: 4"
+          echo "RAM: 16 GB"
+          echo "Disk: 200 GB"
           echo "SSH: Enabled"
           echo "Tailscale: Enabled"
 
