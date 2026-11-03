@@ -1,80 +1,55 @@
-name: Check Linux Runner for Windows QEMU VM
+name: Check Linux Runner for 4 vCPU and 16 GiB RAM
 
 on:
   workflow_dispatch:
 
 jobs:
-  check-host:
+  check-runner:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: Inspect Runner Resources
+      - name: Check Whether 4 vCPU and 16 GiB RAM Are Feasible
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "========== OS =========="
-          cat /etc/os-release
-          echo
+          echo "======================================"
+          echo "HOST CPU"
+          echo "======================================"
+          CPU_COUNT="$(nproc)"
+          lscpu | grep -E '^(CPU\(s\):|Model name:|Thread\(s\) per core:|Core\(s\) per socket:|Socket\(s\):)' || true
+          echo "Available logical CPUs: ${CPU_COUNT}"
 
-          echo "========== CPU =========="
-          lscpu | grep -E '^(Architecture|CPU\(s\)|Model name|Thread|Core|Socket|Hypervisor vendor|Virtualization)' || true
-          echo "Logical CPUs available: $(nproc)"
           echo
-
-          echo "========== MEMORY =========="
+          echo "======================================"
+          echo "HOST MEMORY"
+          echo "======================================"
           free -h
-          awk '/MemTotal/ {printf "Total RAM: %.2f GiB\n", $2/1024/1024}' /proc/meminfo
-          echo
+          AVAILABLE_KIB="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)"
+          AVAILABLE_GIB="$(awk -v kib="${AVAILABLE_KIB}" 'BEGIN {printf "%.2f", kib/1024/1024}')"
+          echo "Currently available memory: ${AVAILABLE_GIB} GiB"
 
-          echo "========== DISK =========="
-          df -h /
           echo
+          echo "======================================"
+          echo "FEASIBILITY RESULT"
+          echo "======================================"
 
-          echo "========== KVM =========="
-          if [ -e /dev/kvm ]; then
-            ls -l /dev/kvm
-            if command -v kvm-ok >/dev/null 2>&1; then kvm-ok || true; fi
+          if [ "${CPU_COUNT}" -lt 4 ]; then
+            echo "RESULT: Fewer than 4 logical CPUs are available; a 4-vCPU VM cannot be guaranteed."
           else
-            echo "/dev/kvm is not available; QEMU may have to use software emulation."
-          fi
-          echo
-
-      - name: Install QEMU and Inspect Capabilities
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-utils
-          echo "========== QEMU VERSION =========="
-          qemu-system-x86_64 --version
-          echo
-          echo "========== QEMU ACCELERATORS =========="
-          qemu-system-x86_64 -accel help || true
-          echo
-
-      - name: Check Whether 8 vCPU and 32 GiB RAM Are Feasible
-        shell: bash
-        run: |
-          set -euo pipefail
-          CPUS=$(nproc)
-          MEM_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-          MEM_GIB=$(awk -v kb="$MEM_KB" 'BEGIN {printf "%.2f", kb/1024/1024}')
-
-          echo "Available logical CPUs: $CPUS"
-          echo "Currently available memory: ${MEM_GIB} GiB"
-
-          if [ "$CPUS" -lt 8 ]; then
-            echo "RESULT: Host exposes fewer than 8 logical CPUs; 8-vCPU VM cannot be guaranteed."
-          else
-            echo "CPU CHECK: Host exposes at least 8 logical CPUs."
+            echo "RESULT: Host exposes at least 4 logical CPUs."
           fi
 
-          if awk -v kb="$MEM_KB" 'BEGIN {exit !(kb >= 32*1024*1024)}'; then
-            echo "RAM CHECK: At least 32 GiB is currently available."
+          # Leave at least 2 GiB for the host OS and QEMU overhead.
+          REQUIRED_KIB=$((16 * 1024 * 1024))
+          SAFE_REQUIRED_KIB=$((18 * 1024 * 1024))
+          if [ "${AVAILABLE_KIB}" -lt "${SAFE_REQUIRED_KIB}" ]; then
+            echo "RESULT: Not enough currently available RAM to safely allocate 16 GiB to a VM while leaving 2 GiB for the host."
+            echo "RECOMMENDATION: Use a host with more RAM, or reduce the guest allocation (for example, to 10-12 GiB)."
           else
-            echo "RESULT: Less than 32 GiB RAM is available now; do not allocate 32 GiB to the VM on this host."
+            echo "RESULT: Available memory appears sufficient for a 16-GiB guest allocation plus a 2-GiB host reserve."
           fi
 
-          echo "This is a capability check only; it does not create or boot a Windows VM."
+          echo
+          echo "NOTE: This workflow only checks host resources. It does not create or boot a Windows VM."
