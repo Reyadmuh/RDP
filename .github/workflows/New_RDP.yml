@@ -1,55 +1,258 @@
-name: Check Linux Runner for 4 vCPU and 16 GiB RAM
+name: Windows Server 2025 QEMU Lab
 
 on:
   workflow_dispatch:
+    inputs:
+      windows_iso_url:
+        description: "Direct HTTPS download URL for the official Windows Server 2025 Evaluation ISO"
+        required: true
+        type: string
 
 jobs:
-  check-runner:
+  windows-vm:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # GitHub-hosted runners normally have limited memory; this workflow reserves
+    # 16 GiB for the guest; this may exceed available runner memory and can fail.
+    timeout-minutes: 350
 
     steps:
-      - name: Check Whether 4 vCPU and 16 GiB RAM Are Feasible
+      - name: Check host resources
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "======================================"
-          echo "HOST CPU"
-          echo "======================================"
-          CPU_COUNT="$(nproc)"
-          lscpu | grep -E '^(CPU\(s\):|Model name:|Thread\(s\) per core:|Core\(s\) per socket:|Socket\(s\):)' || true
-          echo "Available logical CPUs: ${CPU_COUNT}"
-
-          echo
-          echo "======================================"
-          echo "HOST MEMORY"
-          echo "======================================"
+          echo "=== Host CPU ==="
+          nproc
+          lscpu | grep -E '^(CPU\\(s\\):|Model name:)' || true
+          echo "=== Host memory ==="
           free -h
           AVAILABLE_KIB="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)"
-          AVAILABLE_GIB="$(awk -v kib="${AVAILABLE_KIB}" 'BEGIN {printf "%.2f", kib/1024/1024}')"
-          echo "Currently available memory: ${AVAILABLE_GIB} GiB"
-
-          echo
-          echo "======================================"
-          echo "FEASIBILITY RESULT"
-          echo "======================================"
-
-          if [ "${CPU_COUNT}" -lt 4 ]; then
-            echo "RESULT: Fewer than 4 logical CPUs are available; a 4-vCPU VM cannot be guaranteed."
-          else
-            echo "RESULT: Host exposes at least 4 logical CPUs."
+          AVAILABLE_GIB="$(awk -v k="$AVAILABLE_KIB" 'BEGIN {printf "%.2f", k/1024/1024}')"
+          echo "Available RAM: ${AVAILABLE_GIB} GiB"
+          if [ "$AVAILABLE_KIB" -lt $((14 * 1024 * 1024)) ]; then
+            echo "::warning::Host has less than 14 GiB available. A Windows Server VM may fail or be very slow."
           fi
 
-          # Leave at least 2 GiB for the host OS and QEMU overhead.
-          REQUIRED_KIB=$((16 * 1024 * 1024))
-          SAFE_REQUIRED_KIB=$((18 * 1024 * 1024))
-          if [ "${AVAILABLE_KIB}" -lt "${SAFE_REQUIRED_KIB}" ]; then
-            echo "RESULT: Not enough currently available RAM to safely allocate 16 GiB to a VM while leaving 2 GiB for the host."
-            echo "RECOMMENDATION: Use a host with more RAM, or reduce the guest allocation (for example, to 10-12 GiB)."
+      - name: Install QEMU and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage curl wget unzip
+          qemu-system-x86_64 --version
+          if [ -e /dev/kvm ]; then
+            echo "KVM is available."
           else
-            echo "RESULT: Available memory appears sufficient for a 16-GiB guest allocation plus a 2-GiB host reserve."
+            echo "::warning::/dev/kvm is unavailable; Windows setup may be extremely slow under software emulation."
           fi
 
-          echo
-          echo "NOTE: This workflow only checks host resources. It does not create or boot a Windows VM."
+      - name: Download Windows Server 2025 Evaluation ISO
+        shell: bash
+        env:
+          WINDOWS_ISO_URL: ${{ inputs.windows_iso_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/windows-lab"
+          cd "$HOME/windows-lab"
+          case "$WINDOWS_ISO_URL" in
+            https://*) ;;
+            *) echo "::error::Only HTTPS ISO URLs are accepted."; exit 1 ;;
+          esac
+          curl -fL --retry 5 --retry-delay 10 --retry-all-errors \
+            --connect-timeout 30 --max-time 7200 \
+            -o windows-server-2025.iso "$WINDOWS_ISO_URL"
+          if [ "$(stat -c%s windows-server-2025.iso)" -lt 3000000000 ]; then
+            echo "::error::Downloaded file is unexpectedly small; the URL may not point to the ISO."
+            exit 1
+          fi
+          file windows-server-2025.iso || true
+          ls -lh windows-server-2025.iso
+
+      - name: Create Windows virtual disk and unattended answer media
+        shell: bash
+        env:
+          VM_ADMIN_PASSWORD: ${{ secrets.WINDOWS_VM_ADMIN_PASSWORD }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -euo pipefail
+          cd "$HOME/windows-lab"
+          if [ -z "${VM_ADMIN_PASSWORD:-}" ]; then
+            echo "::error::Add a repository Actions secret named WINDOWS_VM_ADMIN_PASSWORD with a strong password."
+            exit 1
+          fi
+          if [ -z "${TAILSCALE_AUTH_KEY:-}" ]; then
+            echo "::error::Add a repository Actions secret named TAILSCALE_AUTH_KEY."
+            exit 1
+          fi
+          if [ "${#VM_ADMIN_PASSWORD}" -lt 14 ]; then
+            echo "::error::WINDOWS_VM_ADMIN_PASSWORD must be at least 14 characters."
+            exit 1
+          fi
+
+          qemu-img create -f qcow2 windows-server-2025.qcow2 200G
+
+          # Escape XML-special characters in the secret before inserting it.
+          export XML_PASSWORD XML_TAILSCALE_KEY
+          XML_PASSWORD="$(python3 - <<'PY'
+          import html, os
+          print(html.escape(os.environ["VM_ADMIN_PASSWORD"], quote=True))
+          PY
+          )"
+          XML_TAILSCALE_KEY="$(python3 - <<'PY'
+          import html, os
+          print(html.escape(os.environ["TAILSCALE_AUTH_KEY"], quote=True))
+          PY
+          )"
+
+          mkdir -p answer-media
+          cat > answer-media/autounattend.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <unattend xmlns="urn:schemas-microsoft-com:unattend"
+                    xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <settings pass="windowsPE">
+              <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+                <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+                <InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale><UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale>
+              </component>
+              <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+                <DiskConfiguration>
+                  <Disk wcm:action="add"><DiskID>0</DiskID><WillWipeDisk>true</WillWipeDisk>
+                    <CreatePartitions>
+                      <CreatePartition wcm:action="add"><Order>1</Order><Type>Primary</Type><Size>500</Size></CreatePartition>
+                      <CreatePartition wcm:action="add"><Order>2</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition>
+                    </CreatePartitions>
+                    <ModifyPartitions>
+                      <ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Format>NTFS</Format><Label>System</Label><Active>true</Active></ModifyPartition>
+                      <ModifyPartition wcm:action="add"><Order>2</Order><PartitionID>2</PartitionID><Format>NTFS</Format><Label>Windows</Label></ModifyPartition>
+                    </ModifyPartitions>
+                  </Disk>
+                  <WillShowUI>OnError</WillShowUI>
+                </DiskConfiguration>
+                <ImageInstall><OSImage><InstallTo><DiskID>0</DiskID><PartitionID>2</PartitionID></InstallTo></OSImage></ImageInstall>
+                <UserData><AcceptEula>true</AcceptEula><FullName>Lab Administrator</FullName><Organization>Lab</Organization></UserData>
+              </component>
+            </settings>
+            <settings pass="specialize">
+              <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+                <ComputerName>WS2025-LAB</ComputerName><TimeZone>UTC</TimeZone>
+              </component>
+            </settings>
+            <settings pass="oobeSystem">
+              <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+                <InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale><UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale>
+              </component>
+              <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+                <OOBE><HideEULAPage>true</HideEULAPage><HideLocalAccountScreen>true</HideLocalAccountScreen><HideOnlineAccountScreens>true</HideOnlineAccountScreens><NetworkLocation>Work</NetworkLocation><ProtectYourPC>3</ProtectYourPC></OOBE>
+                <UserAccounts><AdministratorPassword><Value>__ADMIN_PASSWORD__</Value><PlainText>true</PlainText></AdministratorPassword></UserAccounts>
+                <AutoLogon><Password><Value>__ADMIN_PASSWORD__</Value><PlainText>true</PlainText></Password><Enabled>true</Enabled><LogonCount>1</LogonCount><Username>Administrator</Username></AutoLogon>
+                <FirstLogonCommands>
+                  <SynchronousCommand wcm:action="add"><Order>1</Order><Description>Enable RDP and configure firewall</Description><CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'; Set-Service TermService -StartupType Automatic"</CommandLine><RequiresUserInput>false</RequiresUserInput></SynchronousCommand>
+                  <SynchronousCommand wcm:action="add"><Order>2</Order><Description>Install and connect Tailscale</Description><CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p=Join-Path $env:TEMP 'tailscale-setup.exe'; Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $p; Start-Process $p -ArgumentList '/quiet' -Wait; $ts=Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'; for($i=0;$i -lt 30 -and -not (Test-Path $ts);$i++){Start-Sleep 2}; if(Test-Path $ts){&amp; $ts up --authkey=__TAILSCALE_AUTH_KEY__ --hostname=ws2025-gh-${{ github.run_id }} --accept-routes=false}"</CommandLine><RequiresUserInput>false</RequiresUserInput></SynchronousCommand>
+                </FirstLogonCommands>
+              </component>
+            </settings>
+          </unattend>
+          XML
+
+          # Substitute the secret without logging it.
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          p = Path("answer-media/autounattend.xml")
+          s = p.read_text()
+          s = s.replace("__ADMIN_PASSWORD__", os.environ["XML_PASSWORD"])
+          s = s.replace("__TAILSCALE_AUTH_KEY__", os.environ["XML_TAILSCALE_KEY"])
+          p.write_text(s)
+          PY
+          genisoimage -quiet -o answer.iso -V ANSWER -J -r answer-media
+          chmod 600 answer.iso windows-server-2025.qcow2
+
+      - name: Start Windows Server VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$HOME/windows-lab"
+          if [ -e /dev/kvm ]; then
+            ACCEL="kvm"
+            CPU="host"
+          else
+            ACCEL="tcg"
+            CPU="max"
+          fi
+
+          # Four vCPUs and 16 GiB RAM are requested; runner memory may be insufficient.
+          # RDP is forwarded to the runner's localhost only; do not expose 3389 publicly.
+          nohup qemu-system-x86_64 \
+            -name windows-server-2025 \
+            -machine q35,accel="$ACCEL" \
+            -cpu "$CPU" \
+            -smp 4 \
+            -m 16384 \
+            -drive file=windows-server-2025.qcow2,if=virtio,format=qcow2 \
+            -cdrom windows-server-2025.iso \
+            -drive file=answer.iso,media=cdrom,readonly=on \
+            -boot order=d \
+            -netdev user,id=net0,hostfwd=tcp:127.0.0.1:13389-:3389 \
+            -device e1000,netdev=net0 \
+            -vga std \
+            -display none \
+            -serial file:windows-serial.log \
+            -monitor none \
+            -no-reboot \
+            > qemu.log 2>&1 &
+          echo $! > qemu.pid
+          echo "QEMU started with PID $(cat qemu.pid)."
+          echo "RDP is available on the guest's Tailscale IP after Windows setup and Tailscale authentication."
+          echo "Windows setup can take a long time without KVM acceleration."
+
+      - name: Wait for Windows setup and RDP
+        shell: bash
+        run: |
+          set -u
+          cd "$HOME/windows-lab"
+          for i in $(seq 1 210); do
+            if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
+              echo "::error::QEMU exited before RDP became available."
+              tail -n 120 qemu.log || true
+              tail -n 120 windows-serial.log || true
+              exit 1
+            fi
+            if timeout 2 bash -c '</dev/tcp/127.0.0.1/13389' 2>/dev/null; then
+              echo "RDP port is listening on the host."
+              break
+            fi
+            if [ "$i" -eq 210 ]; then
+              echo "::error::RDP did not become available within 35 minutes. Windows installation may require troubleshooting."
+              tail -n 120 qemu.log || true
+              tail -n 120 windows-serial.log || true
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Note: the port test only checks TCP listening; it does not verify successful Windows login."
+
+      - name: Keep VM alive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$HOME/windows-lab"
+          echo "Windows Server 2025 QEMU VM is running."
+          echo "Connect from your PC to the Windows VM's Tailscale IP on TCP 3389."
+          echo "Use username Administrator and the WINDOWS_VM_ADMIN_PASSWORD secret."
+          echo "Do not expose RDP to the public internet."
+          echo "The GitHub-hosted runner is ephemeral and the VM disappears when the job ends."
+          while kill -0 "$(cat qemu.pid)" 2>/dev/null; do
+            echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] VM is running."
+            sleep 300
+          done
+
+      - name: Upload diagnostic logs if the job fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-server-2025-qemu-logs
+          path: |
+            ~/windows-lab/qemu.log
+            ~/windows-lab/windows-serial.log
+          if-no-files-found: ignore
+          retention-days: 3
