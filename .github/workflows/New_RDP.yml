@@ -172,44 +172,45 @@ jobs:
         run: |
           set -euo pipefail
           cd "$HOME/windows-lab"
-          if [ -e /dev/kvm ]; then
-            ACCEL="kvm"
-            CPU="host"
-          else
-            ACCEL="tcg"
-            CPU="max"
-          fi
 
-          # Four vCPUs and 16 GiB RAM are requested; runner memory may be insufficient.
-          # RDP is forwarded to the runner's localhost only; do not expose 3389 publicly.
+          # GitHub-hosted runners may expose /dev/kvm without granting this job
+          # permission to use it. Force software emulation to avoid KVM permission errors.
+          ACCEL="tcg,thread=multi"
+          CPU="max"
+
+          # Keep the requested 16 GiB guest RAM and 4 vCPUs.
+          # Use an IDE disk so Windows Setup can see it without VirtIO drivers.
+          # Boot from the ISO once, then boot from the installed virtual disk.
           nohup qemu-system-x86_64 \
             -name windows-server-2025 \
-            -machine q35,accel="$ACCEL" \
+            -machine pc,accel="$ACCEL" \
             -cpu "$CPU" \
             -smp 4 \
             -m 16384 \
-            -drive file=windows-server-2025.qcow2,if=virtio,format=qcow2 \
+            -drive file=windows-server-2025.qcow2,if=ide,format=qcow2 \
             -cdrom windows-server-2025.iso \
             -drive file=answer.iso,media=cdrom,readonly=on \
-            -boot order=d \
+            -boot order=c,once=d \
             -netdev user,id=net0,hostfwd=tcp:127.0.0.1:13389-:3389 \
             -device e1000,netdev=net0 \
             -vga std \
             -display none \
             -serial file:windows-serial.log \
             -monitor none \
-            -no-reboot \
             > qemu.log 2>&1 &
           echo $! > qemu.pid
+          touch windows-serial.log qemu.log
           echo "QEMU started with PID $(cat qemu.pid)."
-          echo "RDP is available on the guest's Tailscale IP after Windows setup and Tailscale authentication."
-          echo "Windows setup can take a long time without KVM acceleration."
+          echo "Acceleration: $ACCEL (software emulation; slower than KVM)."
+          echo "Guest memory requested: 16384 MiB; guest CPUs: 4."
+          echo "RDP is forwarded to runner localhost:13389 and the guest is intended to join Tailscale after first logon."
 
       - name: Wait for Windows setup and RDP
         shell: bash
         run: |
           set -u
           cd "$HOME/windows-lab"
+          touch qemu.log windows-serial.log
           for i in $(seq 1 210); do
             if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
               echo "::error::QEMU exited before RDP became available."
@@ -252,7 +253,7 @@ jobs:
         with:
           name: windows-server-2025-qemu-logs
           path: |
-            ~/windows-lab/qemu.log
-            ~/windows-lab/windows-serial.log
+            /home/runner/windows-lab/qemu.log
+            /home/runner/windows-lab/windows-serial.log
           if-no-files-found: ignore
           retention-days: 3
