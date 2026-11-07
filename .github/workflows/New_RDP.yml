@@ -260,7 +260,7 @@ jobs:
         id: connection
         shell: bash
         env:
-          RUNNER_TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_RUNNER_AUTH_KEY }}
+          RUNNER_TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
           VM_HOSTNAME: ws2025-gh-${{ github.run_id }}
           ADMIN_PASSWORD: ${{ steps.credentials.outputs.admin_password }}
           WINDOWS_ISO_URL: ${{ inputs.windows_iso_url }}
@@ -268,7 +268,7 @@ jobs:
           set -euo pipefail
 
           if [ -z "${RUNNER_TAILSCALE_AUTH_KEY:-}" ]; then
-            echo "::error::Add repository Actions secret TAILSCALE_RUNNER_AUTH_KEY. It must be a separate reusable Tailscale auth key for the GitHub runner."
+            echo "::error::Repository Actions secret TAILSCALE_AUTH_KEY is missing. The existing key must be reusable and permitted to register both the Windows guest and GitHub runner."
             exit 1
           fi
 
@@ -291,7 +291,7 @@ jobs:
           done
 
           if [ -z "$VM_TAILSCALE_IP" ]; then
-            echo "::error::Windows VM did not appear in Tailscale. Check guest TAILSCALE_AUTH_KEY and first-logon setup."
+            echo "::error::Windows VM did not appear in Tailscale. Check that TAILSCALE_AUTH_KEY is reusable and that Windows completed first-logon setup."
             sudo tailscale status || true
             exit 1
           fi
