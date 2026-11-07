@@ -7,6 +7,7 @@ on:
         description: "Direct HTTPS download URL for the official Windows Server 2025 Evaluation ISO"
         required: true
         type: string
+        default: "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
 
 jobs:
   windows-vm:
@@ -16,6 +17,29 @@ jobs:
     timeout-minutes: 350
 
     steps:
+      - name: Generate strong Windows Administrator credentials
+        id: credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          PASSWORD="$(python3 - <<'PY'
+          import secrets, string
+          alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
+          while True:
+              value = ''.join(secrets.choice(alphabet) for _ in range(28))
+              if (any(c.islower() for c in value)
+                  and any(c.isupper() for c in value)
+                  and any(c.isdigit() for c in value)
+                  and any(c in "!@#$%^&*()-_=+" for c in value)):
+                  print(value)
+                  break
+          PY
+          )"
+          echo "admin_password=$PASSWORD" >> "$GITHUB_OUTPUT"
+          echo "A new 28-character complex Administrator password was generated for this run."
+          # Deliberately do not mask this generated password: it is displayed in the
+          # private Actions run summary below, as requested. Restrict repository access.
+
       - name: Check host resources
         shell: bash
         run: |
@@ -37,7 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage curl wget unzip
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage curl wget unzip jq
           qemu-system-x86_64 --version
           if [ -e /dev/kvm ]; then
             echo "KVM is available."
@@ -70,21 +94,21 @@ jobs:
       - name: Create Windows virtual disk and unattended answer media
         shell: bash
         env:
-          VM_ADMIN_PASSWORD: ${{ secrets.WINDOWS_VM_ADMIN_PASSWORD }}
+          VM_ADMIN_PASSWORD: ${{ steps.credentials.outputs.admin_password }}
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           set -euo pipefail
           cd "$HOME/windows-lab"
           if [ -z "${VM_ADMIN_PASSWORD:-}" ]; then
-            echo "::error::Add a repository Actions secret named WINDOWS_VM_ADMIN_PASSWORD with a strong password."
+            echo "::error::Generated Administrator password is missing."
             exit 1
           fi
           if [ -z "${TAILSCALE_AUTH_KEY:-}" ]; then
             echo "::error::Add a repository Actions secret named TAILSCALE_AUTH_KEY."
             exit 1
           fi
-          if [ "${#VM_ADMIN_PASSWORD}" -lt 14 ]; then
-            echo "::error::WINDOWS_VM_ADMIN_PASSWORD must be at least 14 characters."
+          if [ "${#VM_ADMIN_PASSWORD}" -lt 20 ]; then
+            echo "::error::Generated Administrator password is too short."
             exit 1
           fi
 
@@ -232,16 +256,85 @@ jobs:
           done
           echo "Note: the port test only checks TCP listening; it does not verify successful Windows login."
 
+      - name: Publish RDP connection details
+        id: connection
+        shell: bash
+        env:
+          RUNNER_TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_RUNNER_AUTH_KEY }}
+          VM_HOSTNAME: ws2025-gh-${{ github.run_id }}
+          ADMIN_PASSWORD: ${{ steps.credentials.outputs.admin_password }}
+          WINDOWS_ISO_URL: ${{ inputs.windows_iso_url }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RUNNER_TAILSCALE_AUTH_KEY:-}" ]; then
+            echo "::error::Add repository Actions secret TAILSCALE_RUNNER_AUTH_KEY. It must be a separate reusable Tailscale auth key for the GitHub runner."
+            exit 1
+          fi
+
+          sudo tailscale status >/dev/null 2>&1 || {
+            curl -fsSL https://tailscale.com/install.sh | sh
+            sudo tailscale up --authkey="$RUNNER_TAILSCALE_AUTH_KEY" \
+              --hostname="gh-runner-${GITHUB_RUN_ID}" --accept-routes=false
+          }
+
+          echo "Waiting for Windows guest '$VM_HOSTNAME' to appear in Tailscale..."
+          VM_TAILSCALE_IP=""
+          for i in $(seq 1 60); do
+            VM_TAILSCALE_IP="$(sudo tailscale status --json | jq -r --arg host "$VM_HOSTNAME" '
+              .Peer[]?
+              | select((.HostName // .DNSName // "") | sub("\\.$"; "") == $host)
+              | .TailscaleIPs[0] // empty
+            ' | head -n 1)"
+            if [ -n "$VM_TAILSCALE_IP" ]; then break; fi
+            sleep 10
+          done
+
+          if [ -z "$VM_TAILSCALE_IP" ]; then
+            echo "::error::Windows VM did not appear in Tailscale. Check guest TAILSCALE_AUTH_KEY and first-logon setup."
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          RDP_ADDRESS="$VM_TAILSCALE_IP:3389"
+          {
+            echo "# Windows Server 2025 — Connection details"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Status | **Running** |"
+            echo "| Tailscale IP | \`$VM_TAILSCALE_IP\` |"
+            echo "| RDP address | \`$RDP_ADDRESS\` |"
+            echo "| RDP username | \`Administrator\` |"
+            echo "| RDP password | \`$ADMIN_PASSWORD\` |"
+            echo ""
+            echo "## Connect"
+            echo "On Windows, press Win+R and run: \`mstsc /v:$VM_TAILSCALE_IP\`"
+            echo ""
+            echo "## Windows Server 2025 Evaluation ISO"
+            echo "[Download Windows Server 2025 ISO (Microsoft)]($WINDOWS_ISO_URL)"
+            echo ""
+            echo "## Important"
+            echo "- This is a generated 28-character password. Save it securely."
+            echo "- Anyone with access to this workflow run summary may be able to see the password."
+            echo "- Keep the GitHub Actions job running while using the VM; the hosted runner and VM are temporary."
+            echo "- RDP is reachable over your Tailscale network only; do not expose TCP 3389 publicly."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Windows Server 2025 VM is running."
+          echo "Tailscale IP : $VM_TAILSCALE_IP"
+          echo "RDP address  : $RDP_ADDRESS"
+          echo "RDP username : Administrator"
+          echo "RDP password: displayed in the private GitHub Actions run summary."
+          echo "Windows ISO  : $WINDOWS_ISO_URL"
+          echo "mstsc /v:$VM_TAILSCALE_IP"
+
       - name: Keep VM alive
         shell: bash
         run: |
           set -euo pipefail
           cd "$HOME/windows-lab"
-          echo "Windows Server 2025 QEMU VM is running."
-          echo "Connect from your PC to the Windows VM's Tailscale IP on TCP 3389."
-          echo "Use username Administrator and the WINDOWS_VM_ADMIN_PASSWORD secret."
-          echo "Do not expose RDP to the public internet."
-          echo "The GitHub-hosted runner is ephemeral and the VM disappears when the job ends."
+          echo "Windows Server 2025 QEMU VM is running; keep this job active to keep the VM alive."
           while kill -0 "$(cat qemu.pid)" 2>/dev/null; do
             echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] VM is running."
             sleep 300
