@@ -175,7 +175,6 @@ jobs:
 
           # GitHub-hosted runners may expose /dev/kvm without granting this job
           # permission to use it. Force software emulation to avoid KVM permission errors.
-          ACCEL="tcg,thread=multi"
           CPU="max"
 
           # Keep the requested 16 GiB guest RAM and 4 vCPUs.
@@ -183,7 +182,8 @@ jobs:
           # Boot from the ISO once, then boot from the installed virtual disk.
           nohup qemu-system-x86_64 \
             -name windows-server-2025 \
-            -machine pc,accel="$ACCEL" \
+            -machine pc \
+            -accel tcg,thread=multi \
             -cpu "$CPU" \
             -smp 4 \
             -m 16384 \
@@ -201,7 +201,7 @@ jobs:
           echo $! > qemu.pid
           touch windows-serial.log qemu.log
           echo "QEMU started with PID $(cat qemu.pid)."
-          echo "Acceleration: $ACCEL (software emulation; slower than KVM)."
+          echo "Acceleration: TCG software emulation (slower than KVM)."
           echo "Guest memory requested: 16384 MiB; guest CPUs: 4."
           echo "RDP is forwarded to runner localhost:13389 and the guest is intended to join Tailscale after first logon."
 
