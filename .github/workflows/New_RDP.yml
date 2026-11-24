@@ -171,7 +171,7 @@ jobs:
                 <AutoLogon><Password><Value>__ADMIN_PASSWORD__</Value><PlainText>true</PlainText></Password><Enabled>true</Enabled><LogonCount>1</LogonCount><Username>Administrator</Username></AutoLogon>
                 <FirstLogonCommands>
                   <SynchronousCommand wcm:action="add"><Order>1</Order><Description>Enable RDP and configure firewall</Description><CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'; Set-Service TermService -StartupType Automatic"</CommandLine><RequiresUserInput>false</RequiresUserInput></SynchronousCommand>
-                  <SynchronousCommand wcm:action="add"><Order>2</Order><Description>Install and connect Tailscale</Description><CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p=Join-Path $env:TEMP 'tailscale-setup.exe'; Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $p; Start-Process $p -ArgumentList '/quiet' -Wait; $ts=Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'; for($i=0;$i -lt 30 -and -not (Test-Path $ts);$i++){Start-Sleep 2}; if(Test-Path $ts){&amp; $ts up --authkey=__TAILSCALE_AUTH_KEY__ --hostname=ws2025-gh-${{ github.run_id }} --accept-routes=false}"</CommandLine><RequiresUserInput>false</RequiresUserInput></SynchronousCommand>
+                  <SynchronousCommand wcm:action="add"><Order>2</Order><Description>Install, verify and connect Tailscale with retries</Description><CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$log='C:\Windows\Temp\tailscale-setup.log'; try { $p=Join-Path $env:TEMP 'tailscale-setup.exe'; $downloaded=$false; for($i=1;$i -le 6 -and -not $downloaded;$i++){ try { Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $p -UseBasicParsing; $downloaded=$true } catch { Add-Content $log ('Download attempt '+$i+': '+$_); Start-Sleep 15 } }; if(-not $downloaded){ throw 'Tailscale installer download failed after retries' }; $proc=Start-Process $p -ArgumentList '/quiet' -Wait -PassThru; Add-Content $log ('Installer exit code: '+$proc.ExitCode); $ts=Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'; for($i=1;$i -le 180 -and -not (Test-Path $ts);$i++){ Start-Sleep 2 }; if(-not (Test-Path $ts)){ throw 'tailscale.exe did not appear after installer' }; Set-Service Tailscale -StartupType Automatic -ErrorAction SilentlyContinue; Start-Service Tailscale -ErrorAction SilentlyContinue; Start-Sleep 5; &amp; $ts up --authkey=__TAILSCALE_AUTH_KEY__ --hostname=ws2025-gh-${{ github.run_id }} --accept-routes=false 2>&amp;1 | Out-File -Append $log; if($LASTEXITCODE -ne 0){ throw ('tailscale up failed with exit code '+$LASTEXITCODE) }; &amp; $ts ip -4 | Out-File -Append $log; Add-Content $log 'Tailscale setup completed successfully.' } catch { Add-Content $log ('FATAL: '+$_); exit 1 }"</CommandLine><RequiresUserInput>false</RequiresUserInput></SynchronousCommand>
                 </FirstLogonCommands>
               </component>
             </settings>
@@ -267,28 +267,48 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Publish credentials and the ISO link immediately, even if guest Tailscale
+          # registration is delayed. The guest IP is appended after discovery.
+          {
+            echo "# Windows Server 2025 — RDP connection details"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| VM status | QEMU running; checking Tailscale registration |"
+            echo "| Tailscale IP | Waiting for Windows guest |"
+            echo "| RDP address | Will be shown when guest IP is discovered |"
+            echo "| RDP username | \`Administrator\` |"
+            echo "| RDP password | \`$ADMIN_PASSWORD\` |"
+            echo ""
+            echo "## Windows Server 2025 Evaluation ISO"
+            echo "[Download Windows Server 2025 ISO (Microsoft)]($WINDOWS_ISO_URL)"
+            echo ""
+            echo "## Connect"
+            echo "When the Tailscale IP appears, connect with: \`mstsc /v:<TAILSCALE-IP>\`"
+            echo ""
+            echo "Keep this GitHub Actions job running while using the VM. The VM is temporary and is removed when the job ends."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "RDP username : Administrator"
+          echo "RDP password : $ADMIN_PASSWORD"
+          echo "Windows ISO  : $WINDOWS_ISO_URL"
+
           if [ -z "${RUNNER_TAILSCALE_AUTH_KEY:-}" ]; then
-            echo "::error::Repository Actions secret TAILSCALE_AUTH_KEY is missing. The existing key must be reusable and permitted to register both the Windows guest and GitHub runner."
-            exit 1
+            echo "::warning::TAILSCALE_AUTH_KEY is empty; username/password and ISO link are shown, but guest IP cannot be discovered."
+            exit 0
           fi
 
-          # Install the client only if it is missing. Do not use `tailscale status`
-          # as an installation/login test: status may return successfully while logged out.
           if ! command -v tailscale >/dev/null 2>&1; then
             curl -fsSL https://tailscale.com/install.sh | sh
           fi
 
-          # Always authenticate this fresh GitHub-hosted runner explicitly.
-          # This uses the same existing secret as the Windows guest.
           sudo tailscale up --authkey="$RUNNER_TAILSCALE_AUTH_KEY" \
             --hostname="gh-runner-${GITHUB_RUN_ID}" --accept-routes=false
 
-          echo "Runner Tailscale status:"
-          sudo tailscale status || true
           echo "Runner Tailscale IP:"
           sudo tailscale ip -4 || true
-
           echo "Waiting for Windows guest '$VM_HOSTNAME' to appear in Tailscale..."
+
           VM_TAILSCALE_IP=""
           for i in $(seq 1 60); do
             VM_TAILSCALE_IP="$(sudo tailscale status --json | jq -r --arg host "$VM_HOSTNAME" '
@@ -301,46 +321,43 @@ jobs:
           done
 
           if [ -z "$VM_TAILSCALE_IP" ]; then
-            echo "::error::Windows VM did not appear in Tailscale. Check that TAILSCALE_AUTH_KEY is reusable and that Windows completed first-logon setup."
-            echo "Final Tailscale status:"
+            {
+              echo ""
+              echo "## Tailscale IP status"
+              echo "**Not detected yet.** The Windows guest has not registered in Tailscale."
+              echo ""
+              echo "Runner Tailscale status:"
+              echo '```text'
+              sudo tailscale status || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Windows guest did not appear in Tailscale. Username and password are available in the Summary; IP is not available yet."
             sudo tailscale status || true
-            echo "Tailscale JSON (peer discovery diagnostics):"
-            sudo tailscale status --json | jq '{Self: .Self, Peer: [.Peer[]? | {HostName, DNSName, TailscaleIPs, Online}]}' || true
-            exit 1
+            exit 0
           fi
 
           RDP_ADDRESS="$VM_TAILSCALE_IP:3389"
           {
-            echo "# Windows Server 2025 — Connection details"
             echo ""
+            echo "## Tailscale connection"
             echo "| Item | Value |"
             echo "|---|---|"
-            echo "| Status | **Running** |"
+            echo "| VM status | **Running and visible in Tailscale** |"
             echo "| Tailscale IP | \`$VM_TAILSCALE_IP\` |"
             echo "| RDP address | \`$RDP_ADDRESS\` |"
             echo "| RDP username | \`Administrator\` |"
             echo "| RDP password | \`$ADMIN_PASSWORD\` |"
             echo ""
-            echo "## Connect"
-            echo "On Windows, press Win+R and run: \`mstsc /v:$VM_TAILSCALE_IP\`"
-            echo ""
-            echo "## Windows Server 2025 Evaluation ISO"
-            echo "[Download Windows Server 2025 ISO (Microsoft)]($WINDOWS_ISO_URL)"
-            echo ""
-            echo "## Important"
-            echo "- This is a generated 28-character password. Save it securely."
-            echo "- Anyone with access to this workflow run summary may be able to see the password."
-            echo "- Keep the GitHub Actions job running while using the VM; the hosted runner and VM are temporary."
-            echo "- RDP is reachable over your Tailscale network only; do not expose TCP 3389 publicly."
+            echo "Run on your Windows PC: \`mstsc /v:$VM_TAILSCALE_IP\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Windows Server 2025 VM is running."
+          echo "=============================================="
+          echo "WINDOWS SERVER 2025 RDP CONNECTION"
           echo "Tailscale IP : $VM_TAILSCALE_IP"
           echo "RDP address  : $RDP_ADDRESS"
-          echo "RDP username : Administrator"
-          echo "RDP password: displayed in the private GitHub Actions run summary."
-          echo "Windows ISO  : $WINDOWS_ISO_URL"
-          echo "mstsc /v:$VM_TAILSCALE_IP"
+          echo "Username     : Administrator"
+          echo "Password     : $ADMIN_PASSWORD"
+          echo "=============================================="
 
       - name: Keep VM alive
         shell: bash
