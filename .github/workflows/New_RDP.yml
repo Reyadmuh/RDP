@@ -272,11 +272,21 @@ jobs:
             exit 1
           fi
 
-          sudo tailscale status >/dev/null 2>&1 || {
+          # Install the client only if it is missing. Do not use `tailscale status`
+          # as an installation/login test: status may return successfully while logged out.
+          if ! command -v tailscale >/dev/null 2>&1; then
             curl -fsSL https://tailscale.com/install.sh | sh
-            sudo tailscale up --authkey="$RUNNER_TAILSCALE_AUTH_KEY" \
-              --hostname="gh-runner-${GITHUB_RUN_ID}" --accept-routes=false
-          }
+          fi
+
+          # Always authenticate this fresh GitHub-hosted runner explicitly.
+          # This uses the same existing secret as the Windows guest.
+          sudo tailscale up --authkey="$RUNNER_TAILSCALE_AUTH_KEY" \
+            --hostname="gh-runner-${GITHUB_RUN_ID}" --accept-routes=false
+
+          echo "Runner Tailscale status:"
+          sudo tailscale status || true
+          echo "Runner Tailscale IP:"
+          sudo tailscale ip -4 || true
 
           echo "Waiting for Windows guest '$VM_HOSTNAME' to appear in Tailscale..."
           VM_TAILSCALE_IP=""
@@ -292,7 +302,10 @@ jobs:
 
           if [ -z "$VM_TAILSCALE_IP" ]; then
             echo "::error::Windows VM did not appear in Tailscale. Check that TAILSCALE_AUTH_KEY is reusable and that Windows completed first-logon setup."
+            echo "Final Tailscale status:"
             sudo tailscale status || true
+            echo "Tailscale JSON (peer discovery diagnostics):"
+            sudo tailscale status --json | jq '{Self: .Self, Peer: [.Peer[]? | {HostName, DNSName, TailscaleIPs, Online}]}' || true
             exit 1
           fi
 
