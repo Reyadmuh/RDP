@@ -171,7 +171,7 @@ jobs:
                 <AutoLogon><Password><Value>__ADMIN_PASSWORD__</Value><PlainText>true</PlainText></Password><Enabled>true</Enabled><LogonCount>1</LogonCount><Username>Administrator</Username></AutoLogon>
                 <FirstLogonCommands>
                   <SynchronousCommand wcm:action="add"><Order>1</Order><Description>Enable RDP and configure firewall</Description><CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'; Set-Service TermService -StartupType Automatic"</CommandLine><RequiresUserInput>false</RequiresUserInput></SynchronousCommand>
-                  <SynchronousCommand wcm:action="add"><Order>2</Order><Description>Install, verify and connect Tailscale with retries</Description><CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$log='C:\Windows\Temp\tailscale-setup.log'; try { $p=Join-Path $env:TEMP 'tailscale-setup.exe'; $downloaded=$false; for($i=1;$i -le 6 -and -not $downloaded;$i++){ try { Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $p -UseBasicParsing; $downloaded=$true } catch { Add-Content $log ('Download attempt '+$i+': '+$_); Start-Sleep 15 } }; if(-not $downloaded){ throw 'Tailscale installer download failed after retries' }; $proc=Start-Process $p -ArgumentList '/quiet' -Wait -PassThru; Add-Content $log ('Installer exit code: '+$proc.ExitCode); $ts=Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'; for($i=1;$i -le 180 -and -not (Test-Path $ts);$i++){ Start-Sleep 2 }; if(-not (Test-Path $ts)){ throw 'tailscale.exe did not appear after installer' }; Set-Service Tailscale -StartupType Automatic -ErrorAction SilentlyContinue; Start-Service Tailscale -ErrorAction SilentlyContinue; Start-Sleep 5; &amp; $ts up --authkey=__TAILSCALE_AUTH_KEY__ --hostname=ws2025-gh-${{ github.run_id }} --accept-routes=false 2>&amp;1 | Out-File -Append $log; if($LASTEXITCODE -ne 0){ throw ('tailscale up failed with exit code '+$LASTEXITCODE) }; &amp; $ts ip -4 | Out-File -Append $log; Add-Content $log 'Tailscale setup completed successfully.' } catch { Add-Content $log ('FATAL: '+$_); exit 1 }"</CommandLine><RequiresUserInput>false</RequiresUserInput></SynchronousCommand>
+                  <SynchronousCommand wcm:action="add"><Order>2</Order><Description>Run Tailscale bootstrap from ANSWER media</Description><CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$deadline=(Get-Date).AddMinutes(10); do { $v=Get-Volume -FileSystemLabel ANSWER -ErrorAction SilentlyContinue | Select-Object -First 1; if($v -and $v.DriveLetter -and (Test-Path ($v.DriveLetter+':\\Setup-Tailscale.ps1'))){ &amp; powershell.exe -NoProfile -ExecutionPolicy Bypass -File ($v.DriveLetter+':\\Setup-Tailscale.ps1'); exit $LASTEXITCODE }; Start-Sleep -Seconds 5 } while((Get-Date) -lt $deadline); throw 'ANSWER media Setup-Tailscale.ps1 was not found'"</CommandLine><RequiresUserInput>false</RequiresUserInput></SynchronousCommand>
                 </FirstLogonCommands>
               </component>
             </settings>
@@ -188,6 +188,75 @@ jobs:
           s = s.replace("__TAILSCALE_AUTH_KEY__", os.environ["XML_TAILSCALE_KEY"])
           p.write_text(s)
           PY
+          # SetupComplete runs as LocalSystem after Windows setup, without relying
+          # on an interactive first logon / FirstLogonCommands.
+          mkdir -p 'answer-media/$OEM$/$$/Setup/Scripts'
+          cat > 'answer-media/$OEM$/$$/Setup/Scripts/SetupComplete.cmd' <<'CMD'
+          @echo off
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%WINDIR%\Setup\Scripts\Setup-Tailscale.ps1"
+          exit /b 0
+          CMD
+
+          cat > 'answer-media/$OEM$/$$/Setup/Scripts/Setup-Tailscale.ps1' <<'PS1'
+          $ErrorActionPreference = 'Stop'
+          $Log = 'C:\Windows\Temp\windows-vm-bootstrap.log'
+          Start-Transcript -Path $Log -Append
+          try {
+              # Ensure RDP is enabled even if OOBE first-logon commands were skipped.
+              Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+              Set-Service TermService -StartupType Automatic
+              Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+
+              $Installer = Join-Path $env:TEMP 'tailscale-setup.exe'
+              $Downloaded = $false
+              for ($Attempt = 1; $Attempt -le 8 -and -not $Downloaded; $Attempt++) {
+                  try {
+                      Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $Installer -UseBasicParsing
+                      $Downloaded = $true
+                  } catch {
+                      Write-Output "Tailscale download attempt $Attempt failed: $_"
+                      Start-Sleep -Seconds 15
+                  }
+              }
+              if (-not $Downloaded) { throw 'Unable to download Tailscale installer after 8 attempts.' }
+
+              $Install = Start-Process -FilePath $Installer -ArgumentList '/quiet' -Wait -PassThru
+              Write-Output "Tailscale installer exit code: $($Install.ExitCode)"
+              $Tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+              for ($Attempt = 1; $Attempt -le 180 -and -not (Test-Path $Tailscale); $Attempt++) {
+                  Start-Sleep -Seconds 2
+              }
+              if (-not (Test-Path $Tailscale)) { throw 'tailscale.exe was not installed.' }
+
+              Set-Service -Name Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
+              Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 8
+              $AuthKey = '__TAILSCALE_AUTH_KEY__'
+              & $Tailscale up "--authkey=$AuthKey" "--hostname=ws2025-gh-${{ github.run_id }}" '--unattended' '--accept-routes=false'
+              if ($LASTEXITCODE -ne 0) { throw "tailscale up failed with exit code $LASTEXITCODE" }
+
+              Start-Sleep -Seconds 5
+              & $Tailscale status
+              & $Tailscale ip -4
+              Write-Output 'Windows VM bootstrap and Tailscale registration completed.'
+          } catch {
+              Write-Output "BOOTSTRAP ERROR: $_"
+              exit 1
+          } finally {
+              Stop-Transcript
+          }
+          PS1
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          p = Path('answer-media/$OEM$/$$/Setup/Scripts/Setup-Tailscale.ps1')
+          data = p.read_text()
+          data = data.replace('__TAILSCALE_AUTH_KEY__', os.environ['TAILSCALE_AUTH_KEY'])
+          p.write_text(data)
+          Path('answer-media/Setup-Tailscale.ps1').write_text(data)
+          PY
+
           genisoimage -quiet -o answer.iso -V ANSWER -J -r answer-media
           chmod 600 answer.iso windows-server-2025.qcow2
 
@@ -229,32 +298,23 @@ jobs:
           echo "Guest memory requested: 16384 MiB; guest CPUs: 4."
           echo "RDP is forwarded to runner localhost:13389 and the guest is intended to join Tailscale after first logon."
 
-      - name: Wait for Windows setup and RDP
+      - name: Wait for Windows setup process
         shell: bash
         run: |
-          set -u
+          set -euo pipefail
           cd "$HOME/windows-lab"
-          touch qemu.log windows-serial.log
-          for i in $(seq 1 210); do
+          echo "Waiting for Windows VM to remain running while SetupComplete configures the guest..."
+          for i in $(seq 1 30); do
             if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
-              echo "::error::QEMU exited before RDP became available."
-              tail -n 120 qemu.log || true
-              tail -n 120 windows-serial.log || true
+              echo "::error::QEMU exited during Windows setup."
+              tail -n 160 qemu.log || true
+              tail -n 160 windows-serial.log || true
               exit 1
             fi
-            if timeout 2 bash -c '</dev/tcp/127.0.0.1/13389' 2>/dev/null; then
-              echo "RDP port is listening on the host."
-              break
-            fi
-            if [ "$i" -eq 210 ]; then
-              echo "::error::RDP did not become available within 35 minutes. Windows installation may require troubleshooting."
-              tail -n 120 qemu.log || true
-              tail -n 120 windows-serial.log || true
-              exit 1
-            fi
-            sleep 10
+            sleep 60
+            echo "Windows VM is still running ($i/30 minutes)."
           done
-          echo "Note: the port test only checks TCP listening; it does not verify successful Windows login."
+          echo "Initial VM wait completed. Guest readiness will be verified by Tailscale registration."
 
       - name: Publish RDP connection details
         id: connection
@@ -310,7 +370,7 @@ jobs:
           echo "Waiting for Windows guest '$VM_HOSTNAME' to appear in Tailscale..."
 
           VM_TAILSCALE_IP=""
-          for i in $(seq 1 60); do
+          for i in $(seq 1 180); do
             VM_TAILSCALE_IP="$(sudo tailscale status --json | jq -r --arg host "$VM_HOSTNAME" '
               .Peer[]?
               | select((.HostName // .DNSName // "") | sub("\\.$"; "") == $host)
@@ -378,5 +438,6 @@ jobs:
           path: |
             /home/runner/windows-lab/qemu.log
             /home/runner/windows-lab/windows-serial.log
+            /home/runner/windows-lab/answer-media/$OEM$/$$/Setup/Scripts/Setup-Tailscale.ps1
           if-no-files-found: ignore
           retention-days: 3
